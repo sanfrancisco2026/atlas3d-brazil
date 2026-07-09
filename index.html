@@ -123,6 +123,21 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 #routeCursor{position:absolute;z-index:900;pointer-events:none;display:none;
   transform:translate(-50%,-120%);background:rgba(0,255,157,.9);color:#01130b;font-size:.62rem;
   font-weight:700;padding:3px 8px;border-radius:4px;letter-spacing:.5px}
+
+/* building inspect card (click a building in 3D) */
+#bldCard{position:absolute;z-index:950;display:none;width:216px;
+  background:var(--panel);backdrop-filter:blur(12px);border:1px solid var(--border);
+  border-left:3px solid var(--accent);border-radius:9px;padding:12px 14px;
+  box-shadow:0 14px 40px rgba(0,0,0,.75);pointer-events:none}
+#bldCard .bc-title{font-size:.6rem;letter-spacing:2px;color:var(--accent);
+  font-weight:800;text-transform:uppercase;margin-bottom:8px}
+#bldCard .bc-row{display:flex;justify-content:space-between;font-size:.7rem;
+  color:#8fa0b8;padding:2.5px 0}
+#bldCard .bc-row b{color:#fff;font-weight:700}
+#bldCard .bc-row b.src-osm{color:var(--success)}
+#bldCard .bc-row b.src-shadow{color:var(--accent)}
+#bldCard .bc-row b.src-typo{color:#a7b4c9}
+#bldCard .bc-hint{font-size:.56rem;color:#5d6b83;margin-top:8px;letter-spacing:.5px}
 </style>
 
 <script type="importmap">
@@ -311,6 +326,14 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <!-- ================= 3D ================= -->
 <div id="canvas-container"></div>
 <div id="routeCursor">SET POINT</div>
+<div id="bldCard">
+  <div class="bc-title">Building</div>
+  <div class="bc-row"><span>Height</span><b id="bcH">-</b></div>
+  <div class="bc-row"><span>Floors (est.)</span><b id="bcF">-</b></div>
+  <div class="bc-row"><span>Footprint</span><b id="bcA">-</b></div>
+  <div class="bc-row"><span>Height source</span><b id="bcS">-</b></div>
+  <div class="bc-hint">ESC or click empty ground to close</div>
+</div>
 <div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra taxonomy &amp; voltage palette: OpenInfraMap</div>
 
 <!-- ================= LOADER ================= -->
@@ -964,7 +987,9 @@ function buildBuildings(osm){
     if(h>55) variant=0; else if(p.rand()>0.5) variant=1; else variant=2;
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
-    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz};
+    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
+      area:Math.round(p.area),
+      src:p.tagged?'osm':(p.shadow?'shadow':'typo')};   // height provenance
     if(p.isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
     count++;
   });
@@ -1154,17 +1179,53 @@ $('fogSlider').addEventListener('input',applyAtmosphere);
 ============================================================ */
 const raycaster=new THREE.Raycaster(), mouseNDC=new THREE.Vector2();
 function onCanvasClick(e){
-  if(!routeMode||appState!=='city'||e.button!==0) return;
+  if(appState!=='city'||e.button!==0) return;
   if(downXY&&Math.hypot(e.clientX-downXY[0],e.clientY-downXY[1])>6) return; // was a drag
   mouseNDC.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);
   raycaster.setFromCamera(mouseNDC,camera);
-  const hit=raycaster.intersectObject(groundMesh);
-  if(!hit.length) return;
-  const p=hit[0].point;
-  routeClicks.push(p);
-  addRouteMarker(p,routeClicks.length===1?0x00ff9d:0xff4d5e);
-  if(routeClicks.length===2){ setRouteMode(false); requestRoute(); }
+  if(routeMode){
+    const hit=raycaster.intersectObject(groundMesh);
+    if(!hit.length) return;
+    const p=hit[0].point;
+    routeClicks.push(p);
+    addRouteMarker(p,routeClicks.length===1?0x00ff9d:0xff4d5e);
+    if(routeClicks.length===2){ setRouteMode(false); requestRoute(); }
+    return;
+  }
+  // building inspect: click a building for height/floors/provenance
+  // (skip synthetic infill when the user has toggled it hidden)
+  const pool=cityGroup.children.concat(synGroup.visible?synGroup.children:[]);
+  const hits=raycaster.intersectObjects(pool,false);
+  if(hits.length) selectBuilding(hits[0].object,e.clientX,e.clientY);
+  else hideBldCard();
 }
+
+/* ---- building inspect card ---- */
+const SRC_LABEL={osm:['OSM z-tag','src-osm'],shadow:['shadow-measured','src-shadow'],
+  typo:['typology estimate','src-typo']};
+let selEdges=null;
+function selectBuilding(mesh,cx,cy){
+  hideBldCard();
+  const u=mesh.userData;
+  $('bcH').textContent=Math.round(u.h)+' m';
+  $('bcF').textContent='~'+Math.max(1,Math.round(u.h/3.2));
+  $('bcA').textContent=(u.area||0).toLocaleString()+' m²';
+  const [label,cls]=SRC_LABEL[u.src]||SRC_LABEL.typo;
+  $('bcS').textContent=label; $('bcS').className=cls;
+  const card=$('bldCard'); card.style.display='block';
+  card.style.left=Math.min(cx+16,innerWidth-236)+'px';
+  card.style.top=Math.max(12,Math.min(cy-10,innerHeight-190))+'px';
+  // silhouette highlight on the selected building
+  selEdges=new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry,20),
+    new THREE.LineBasicMaterial({color:0x4facfe,transparent:true,opacity:.95}));
+  scene.add(selEdges);
+}
+function hideBldCard(){
+  $('bldCard').style.display='none';
+  if(selEdges){ scene.remove(selEdges);
+    selEdges.geometry.dispose(); selEdges.material.dispose(); selEdges=null; }
+}
+addEventListener('keydown',e=>{ if(e.key==='Escape') hideBldCard(); });
 function addRouteMarker(p,color){
   const g=new THREE.Group();
   const cone=new THREE.Mesh(new THREE.ConeGeometry(3.2,9,12),
@@ -1178,6 +1239,7 @@ function addRouteMarker(p,color){
 }
 function setRouteMode(on){
   routeMode=on;
+  if(on) hideBldCard();
   $('routeBtn').classList.toggle('active-mode',on);
   $('routeBtn').innerHTML=on?'&#9673; Click start &amp; destination...':'&#9673; Plot Route (OSRM)';
   $('routeCursor').style.display=on?'block':'none';
@@ -1781,7 +1843,7 @@ $('buildBtn').addEventListener('click',async()=>{
 
 $('resetBtn').addEventListener('click',()=>{
   appState='map';
-  setRouteMode(false); routeCurve=null; routePulses=[];
+  setRouteMode(false); hideBldCard(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
   clearGroup(synGroup); synGroup.visible=true;
   $('synBtn').textContent='Synthetic infill: ON';

@@ -67,6 +67,11 @@ two offline data files. There is no server, no package.json, no bundler — open
    lighting; a CORS-tainted canvas degrades to applying the photo untinted.
    Tested by `test/facade_match.test.js` (14 geometry checks; exit 0 = pass).
 8. Routing uses public OSRM; geocoding uses public Nominatim.
+9. In the 3D view, clicking a building (outside route mode) opens an inspect
+   card (`selectBuilding`/`hideBldCard`): height, estimated floors, footprint
+   area, and height provenance — colour-coded OSM z-tag / shadow-measured /
+   typology estimate, from `mesh.userData.src`. ESC or clicking empty ground
+   closes it; hidden synthetic infill is excluded from picking.
 
 ## Credentials
 
