@@ -381,6 +381,7 @@ let camAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
+let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
 let downXY = null;
 let prevT = performance.now();
 
@@ -503,6 +504,7 @@ async function fetchOSM(b){
     relation["building"](${b.S},${b.W},${b.N},${b.E});
     way["highway"](${b.S},${b.W},${b.N},${b.E});
     node["natural"="tree"](${b.S},${b.W},${b.N},${b.E});
+    node["highway"="street_lamp"](${b.S},${b.W},${b.N},${b.E});
   );
   (._;>;);
   out body;`;
@@ -764,11 +766,14 @@ function buildFacadeTexture(style,litRatio){
 function buildSharedMaterials(){
   wallMats=[];
   for(let s=0;s<3;s++){
-    const tx=buildFacadeTexture(s, s===0?0.5:0.35);
+    const tx=buildFacadeTexture(s, s===0?0.55:0.42);
+    // style 0 is the glass curtain-wall: tuned glossy so the PMREM sky
+    // environment reads as real glazing on towers without photo data
     const m=new THREE.MeshStandardMaterial({
-      map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xffc978),
+      map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xffbe6a),
       emissiveIntensity:0, vertexColors:true,
-      roughness:s===0?0.25:0.85, metalness:s===0?0.55:0.05
+      roughness:s===0?0.14:0.85, metalness:s===0?0.85:0.05,
+      envMapIntensity:s===0?1.5:0.25
     });
     wallMats.push(m);
   }
@@ -994,9 +999,11 @@ function buildBuildings(osm){
       if(L2>bestE){ bestE=L2; facadeAz=((Math.atan2(dx,-dy)*180/Math.PI)+360)%180; }
     }
 
-    // material variant: glass for tall, masonry/concrete for the rest
+    // material variant: glazed glass for towers (and some mid-rises),
+    // masonry/concrete for the rest - photo facades override this later
     let variant;
-    if(h>55) variant=0; else if(p.rand()>0.5) variant=1; else variant=2;
+    if(h>55||(h>38&&p.rand()<0.35)) variant=0;
+    else if(p.rand()>0.5) variant=1; else variant=2;
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
     mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
@@ -1207,6 +1214,113 @@ function updateTraffic(dt){
 }
 
 /* ============================================================
+   STREET LIGHTS & NIGHT CALIBRATION
+   Lamps come from OSM highway=street_lamp nodes when the zone has
+   them mapped; otherwise they're derived from the road network
+   itself (regular spacing along each way, alternating sides - the
+   pattern real municipal lighting follows). Their brightness, and
+   the warm window glow of buildings, is calibrated against the NASA
+   VIIRS "Black Marble" night-time satellite composite for this exact
+   location: genuinely bright districts glow harder than dim ones.
+============================================================ */
+// Pure (unit-tested): regular lamp spots along paths, alternating sides.
+function lampPositions(paths,capN){
+  const out=[];
+  for(const p of paths){
+    const spacing=p.major?30:46, side=p.major?7:5;
+    let flip=1;
+    for(let d=spacing/2;d<p.total&&out.length<capN;d+=spacing){
+      const pt=pointOnPath(p,d);
+      const lo=laneOffset(pt.yaw,flip,side);
+      out.push({x:pt.x+lo.ox,z:pt.z+lo.oz});
+      flip=-flip;                       // stagger left/right like real streets
+    }
+    if(out.length>=capN) break;
+  }
+  return out;
+}
+function removeLamps(){
+  if(!lampGroup) return;
+  scene.remove(lampGroup);
+  lampGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+  lampGroup=null;
+}
+function buildStreetLamps(osm){
+  removeLamps();
+  const {cLat,cLon,mPerLon}=geoCtx;
+  // OSM-mapped lamps first
+  let spots=[];
+  osm.elements.forEach(el=>{
+    if(el.type==='node'&&el.tags&&el.tags.highway==='street_lamp')
+      spots.push({x:(el.lon-cLon)*mPerLon, z:(cLat-el.lat)*M_LAT});
+  });
+  const fromOSM=spots.length>=10;
+  if(!fromOSM) spots=lampPositions(trafficPaths,650);   // derive from road grid
+  spots=spots.slice(0,650);
+  if(!spots.length){ log('No street lighting derivable here','ai'); return; }
+
+  lampGroup=new THREE.Group();
+  const N=spots.length;
+  const poleGeo=new THREE.CylinderGeometry(0.06,0.10,6.8,5); poleGeo.translate(0,3.4,0);
+  const poles=new THREE.InstancedMesh(poleGeo,
+    new THREE.MeshStandardMaterial({color:0x2a2d33,roughness:.8,metalness:.3}),N);
+  const bulbGeo=new THREE.SphereGeometry(0.34,6,6); bulbGeo.translate(0,6.9,0);
+  streetLampMat=new THREE.MeshStandardMaterial({color:0x2a2415,
+    emissive:0xffd9a0,emissiveIntensity:0.15});
+  const bulbs=new THREE.InstancedMesh(bulbGeo,streetLampMat,N);
+  const m=new THREE.Matrix4();
+  const glow=[];
+  for(let i=0;i<N;i++){
+    m.makeTranslation(spots[i].x,0,spots[i].z);
+    poles.setMatrixAt(i,m); bulbs.setMatrixAt(i,m);
+    glow.push(spots[i].x,7.0,spots[i].z);
+  }
+  const gg=new THREE.BufferGeometry();
+  gg.setAttribute('position',new THREE.Float32BufferAttribute(glow,3));
+  lampSpriteMat=new THREE.PointsMaterial({map:makePuffTexture(),size:14,transparent:true,
+    opacity:0,color:0xffc477,blending:THREE.AdditiveBlending,depthWrite:false});
+  lampGroup.add(poles,bulbs,new THREE.Points(gg,lampSpriteMat));
+  scene.add(lampGroup);
+  log(`Street lighting: ${N} lamps (${fromOSM?'OSM-mapped':'derived from road network'})`,'ok');
+}
+// Sample NASA VIIRS Black Marble at this location -> night-glow calibration.
+function fetchNightLights(b){
+  return new Promise(resolve=>{
+    const z=8, xf=lon2tile(b.cLon,z), yf=lat2tile(b.cLat,z);
+    const img=new Image(); img.crossOrigin='anonymous';
+    const done=v=>resolve(v);
+    img.onerror=()=>done(1);
+    img.onload=()=>{
+      try{
+        const c=document.createElement('canvas'); c.width=c.height=256;
+        const cx=c.getContext('2d'); cx.drawImage(img,0,0);
+        const px=Math.min(254,Math.max(1,Math.floor((xf%1)*256)));
+        const py=Math.min(254,Math.max(1,Math.floor((yf%1)*256)));
+        const d=cx.getImageData(px-1,py-1,3,3).data;
+        let lum=0; for(let i=0;i<9;i++) lum+=0.299*d[i*4]+0.587*d[i*4+1]+0.114*d[i*4+2];
+        lum/=9;
+        done(clamp(0.4+lum/95,0.4,1.7));
+      }catch(e){ done(1); }
+    };
+    img.src=`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible_Level8/${z}/${Math.floor(yf)}/${Math.floor(xf)}.jpg`;
+  });
+}
+// PMREM environment from the procedural sky: gives tall glass towers real
+// glazed reflections (user-visible on facades with no photo/image data).
+function refreshEnvironment(){
+  try{
+    const pm=new THREE.PMREMGenerator(renderer);
+    const envScene=new THREE.Scene();
+    envScene.add(sky);                       // borrow the sky mesh...
+    const rt=pm.fromScene(envScene,0.04);
+    scene.add(sky);                          // ...and give it straight back
+    if(envRT) envRT.dispose();
+    envRT=rt; scene.environment=rt.texture;
+    pm.dispose();
+  }catch(e){ /* reflections are a bonus - never fatal */ }
+}
+
+/* ============================================================
    AIR QUALITY & POLLUTION (OpenAQ + OSM-derived fallback)
    With a user key, live PM2.5 comes from OpenAQ stations near the
    capture zone. Without one (or on any failure) we estimate it from
@@ -1358,11 +1472,14 @@ function applyAtmosphere(){
   renderer.toneMappingExposure=0.2+0.42*day;
   stars.material.opacity=night*0.9;
 
-  wallMats.forEach(m=>m.emissiveIntensity=night*1.5);
+  // warm window glow + street lamps, calibrated by VIIRS Black Marble
+  wallMats.forEach(m=>m.emissiveIntensity=night*1.6*nightCalib);
   matRoadMajor.emissiveIntensity=0.05+night*1.1;
   matRoadMinor.emissiveIntensity=0.03+night*0.55;
   vehMats.forEach(m=>m.emissiveIntensity=0.3+night*2.6);
   if(lampGlowMat) lampGlowMat.emissiveIntensity=0.2+night*3.2;
+  if(streetLampMat) streetLampMat.emissiveIntensity=(0.15+night*3.6)*nightCalib;
+  if(lampSpriteMat) lampSpriteMat.opacity=night*0.8*Math.min(nightCalib,1.25);
 
   // pollution: smog thickens + browns the fog, haze/smoke fade in with it
   const pol=aqState?clamp(aqState.pm25/60,0,1.2):0;
@@ -1375,6 +1492,8 @@ function applyAtmosphere(){
   bloomPass.radius=0.25+fogAmt*0.5;
 }
 $('timeSlider').addEventListener('input',applyAtmosphere);
+// regenerate sky reflections when the user releases the time slider
+$('timeSlider').addEventListener('change',()=>{ if(appState==='city') refreshEnvironment(); });
 $('fogSlider').addEventListener('input',applyAtmosphere);
 
 /* ============================================================
@@ -2012,8 +2131,10 @@ $('buildBtn').addEventListener('click',async()=>{
     buildRoads(osm);
     buildTrees(osm);
     buildTraffic();
+    buildStreetLamps(osm);
     step('s4','done'); step('s5','doing');
     applyAtmosphere();
+    refreshEnvironment();
     step('s5','done');
 
     await new Promise(r=>setTimeout(r,400));
@@ -2037,6 +2158,11 @@ $('buildBtn').addEventListener('click',async()=>{
     buildPlannerLayers(b);
     applyObliqueFacades(b);
     applyAirQuality(b);
+    fetchNightLights(b).then(c=>{
+      nightCalib=c;
+      applyAtmosphere();
+      log(`Night calibration: VIIRS Black Marble x${c.toFixed(2)}`,'ai');
+    });
   }catch(err){
     console.error(err);
     log('Build failed: '+err.message,'err');
@@ -2054,6 +2180,8 @@ $('resetBtn').addEventListener('click',()=>{
   plannerClear();
   removeTraffic();
   clearPollutionFX(); aqState=null; $('stAQ').innerHTML='&mdash;';
+  removeLamps(); nightCalib=1;
+  scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
   $('viewOrbit').classList.remove('active-mode');

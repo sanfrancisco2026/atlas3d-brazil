@@ -67,6 +67,23 @@ two offline data files. There is no server, no package.json, no bundler — open
    lighting; a CORS-tainted canvas degrades to applying the photo untinted.
    Tested by `test/facade_match.test.js` (14 geometry checks; exit 0 = pass).
 8. Routing uses public OSRM; geocoding uses public Nominatim.
+10. Traffic is a mixed fleet (cars/motos/buses, per-instance paint, buses on
+   major roads only) with right-hand lane discipline via `laneOffset` (pure,
+   tested in `test/traffic_lane.test.js`).
+11. Air quality: `applyAirQuality` uses OpenAQ v3 (optional user key input
+   `#aqKey`) or falls back to `estimatePM25` (pure, tested) derived from road
+   density + industrial footprint collected during build. PM2.5 drives smog
+   fog tint/density, exhaust haze over major roads, and animated smoke plumes
+   from industrial buildings (`buildPollutionFX`/`updatePollution`).
+12. Night: `buildStreetLamps` renders instanced lamps from OSM
+   `highway=street_lamp` nodes (now part of the main Overpass query) or,
+   offline/unmapped, derives them from the road network (`lampPositions`,
+   pure, tested in `test/street_lamps.test.js`). `fetchNightLights` samples
+   NASA GIBS VIIRS Black Marble (public, no key) to calibrate `nightCalib`,
+   which scales lamp brightness and the warm window glow. `refreshEnvironment`
+   builds a PMREM environment from the procedural sky so glass-variant towers
+   (h>55, or >38 with probability) get real glazed reflections when no photo
+   data is available; regenerated when the time slider is released.
 9. In the 3D view, clicking a building (outside route mode) opens an inspect
    card (`selectBuilding`/`hideBldCard`): height, estimated floors, footprint
    area, and height provenance — colour-coded OSM z-tag / shadow-measured /
@@ -80,9 +97,14 @@ No required API keys. All backing services are free/public:
 - Overpass API (several public mirrors, see `OVERPASS` array in the module script).
 - Esri ArcGIS World_Imagery tiles — public, no key.
 - OSRM public router — no key.
+- NASA GIBS (VIIRS Black Marble night-lights tiles) — public, no key.
 - **Mapillary access token** — optional, user-supplied at runtime via the
   "Mapillary token" password input in the UI (for real street-photo facades).
   Never hardcode a token in source; it's a per-session runtime input only.
+- **OpenAQ API key** — optional, user-supplied at runtime via the "OpenAQ key"
+  password input (live PM2.5 from explore.openaq.org). Same rule: never
+  hardcode; without it the app estimates air quality from OSM-derived road
+  density + industrial footprint.
 
 ## Standing rules (for the /loop working on this repo)
 
