@@ -289,6 +289,12 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div id="panel-city" style="display:none">
     <div class="slider-row"><span>Time of day</span><b id="timeVal">17:30</b></div>
     <input type="range" id="timeSlider" min="0" max="24" step="0.1" value="17.5">
+    <div class="btn-row">
+      <button class="ghost td" data-h="6.2">Dawn</button>
+      <button class="ghost td" data-h="12">Noon</button>
+      <button class="ghost td" data-h="17.5">Dusk</button>
+      <button class="ghost td" data-h="21.5">Night</button>
+    </div>
     <div class="slider-row"><span>Atmosphere / mist</span><b id="fogVal">10%</b></div>
     <input type="range" id="fogSlider" min="0" max="100" step="1" value="10">
 
@@ -377,7 +383,7 @@ let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
 let trafficPaths = [], cars = [], trafficMeshes = [];
-let camAnim = null;
+let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
@@ -1491,7 +1497,20 @@ function applyAtmosphere(){
   bloomPass.strength=0.12+night*0.75+fogAmt*0.55;
   bloomPass.radius=0.25+fogAmt*0.5;
 }
-$('timeSlider').addEventListener('input',applyAtmosphere);
+$('timeSlider').addEventListener('input',()=>{ timeAnim=null; applyAtmosphere(); });
+// time-of-day presets: glide the clock instead of jumping, so the sky,
+// lights and reflections are seen transitioning
+document.querySelectorAll('button.td').forEach(b=>b.addEventListener('click',()=>{
+  timeAnim={from:parseFloat($('timeSlider').value), to:parseFloat(b.dataset.h), t:0};
+}));
+function updateTimeAnim(dt){
+  if(!timeAnim) return;
+  timeAnim.t+=dt/1.4;
+  const k=Math.min(1,timeAnim.t), e=k*k*(3-2*k);   // smoothstep
+  $('timeSlider').value=(timeAnim.from+(timeAnim.to-timeAnim.from)*e).toFixed(2);
+  applyAtmosphere();
+  if(k>=1){ timeAnim=null; refreshEnvironment(); } // final glazing update
+}
 // regenerate sky reflections when the user releases the time slider
 $('timeSlider').addEventListener('change',()=>{ if(appState==='city') refreshEnvironment(); });
 $('fogSlider').addEventListener('input',applyAtmosphere);
@@ -2201,7 +2220,7 @@ function animate(){
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt);
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
