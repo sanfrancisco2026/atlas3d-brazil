@@ -948,12 +948,23 @@ function buildBuildings(osm){
     for(let i=0;i<pos.count;i++){ colors[i*3]=tint.r; colors[i*3+1]=tint.g; colors[i*3+2]=tint.b; }
     geom.setAttribute('color',new THREE.BufferAttribute(colors,3));
 
+    // dominant facade plane azimuth (0-180deg, direction-agnostic) from the
+    // longest footprint edge - used by applyObliqueFacades to pick street
+    // photos that actually face this building's main wall.
+    // Scene axes: +x = east, +y(Vector2) = south, so north = -dy.
+    let bestE=0, facadeAz=null;
+    for(let i=0;i<p.pts.length-1;i++){
+      const dx=p.pts[i+1].x-p.pts[i].x, dy=p.pts[i+1].y-p.pts[i].y;
+      const L2=dx*dx+dy*dy;
+      if(L2>bestE){ bestE=L2; facadeAz=((Math.atan2(dx,-dy)*180/Math.PI)+360)%180; }
+    }
+
     // material variant: glass for tall, masonry/concrete for the rest
     let variant;
     if(h>55) variant=0; else if(p.rand()>0.5) variant=1; else variant=2;
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
-    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow};
+    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz};
     if(p.isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
     count++;
   });
@@ -1587,41 +1598,116 @@ async function buildFloodLayer(b){
     `Low-lying / flood-prone (${Math.round(mn)}-${Math.round(mx)}m terrain)`;
   log(`Flood layer ready: terrain ${Math.round(mn)}m to ${Math.round(mx)}m`,'ok');
 }
-/* --- Mapillary street-photo facades (optional token) --- */
+/* ============================================================
+   MAPILLARY STREET-PHOTO FACADES (optional token)
+   Photo selection is orientation-aware, not nearest-centroid: a photo
+   only qualifies if (a) the camera was near the building, (b) the
+   camera's compass bearing means it was LOOKING AT the building, and
+   (c) the camera sits roughly on the normal of the building's dominant
+   facade plane (from its longest footprint edge) - i.e. the photo shows
+   the wall we're about to texture, not its back or a side alley.
+   Each applied photo is then cross-referenced against the captured
+   satellite mosaic: sky-dominated shots are rejected, and the facade
+   material is colour-corrected toward the mosaic's tones so the
+   photo-textured walls sit in the same light as the rest of the scene.
+============================================================ */
+function _angDiffDeg(a,b){ let d=Math.abs(((a-b)%360+360)%360); return d>180?360-d:d; }
+function _bearingDeg(lat1,lon1,lat2,lon2){
+  const dE=(lon2-lon1)*geoCtx.mPerLon, dN=(lat2-lat1)*M_LAT;
+  return ((Math.atan2(dE,dN)*180/Math.PI)+360)%360;
+}
+const FACADE_MAX_D=140;
+// Pure scorer: bld {lat,lon,facadeAz 0-180|null}, ph {ll:[lon,lat], compass deg|null, pano}
+// usedCount discourages stamping one photo across many buildings. Returns -1 = disqualified.
+function scoreFacadePhoto(bld,ph,usedCount){
+  const dx=(ph.ll[0]-bld.lon)*geoCtx.mPerLon, dz=(ph.ll[1]-bld.lat)*M_LAT;
+  const d=Math.hypot(dx,dz);
+  if(d>FACADE_MAX_D||d<3) return -1;
+  const bCam=_bearingDeg(bld.lat,bld.lon,ph.ll[1],ph.ll[0]);       // building -> camera
+  let facadeAlign=0.5;                                              // neutral when unknown
+  if(bld.facadeAz!=null){
+    const dd=Math.min(_angDiffDeg(bCam,(bld.facadeAz+90)%360),
+                      _angDiffDeg(bCam,(bld.facadeAz+270)%360));
+    facadeAlign=Math.max(0,Math.cos(dd*Math.PI/180));               // 1 = dead-on the wall
+  }
+  let viewAlign;
+  if(ph.pano) viewAlign=0.8;                                        // 360deg sees the facade
+  else if(ph.compass==null) viewAlign=0.4;
+  else{
+    const off=_angDiffDeg(ph.compass,(bCam+180)%360);               // 0 = aimed at building
+    if(off>75) return -1;   // camera pointed away: photographs the wrong scene entirely
+    viewAlign=Math.cos(off*Math.PI/180);
+  }
+  const prox=1-d/FACADE_MAX_D;
+  const reuse=(usedCount&&usedCount.get(ph)||0)*0.15;
+  return 0.4*facadeAlign+0.35*viewAlign+0.25*prox-reuse;
+}
+// Cross-reference a loaded photo against the satellite mosaic.
+// Returns null to reject (sky-dominated shot), otherwise a per-channel
+// colour-correction that pulls the photo's facade tones toward the
+// mosaic's ground-truth colour at that building. White = no-op fallback
+// when the canvas is CORS-tainted and pixels can't be read.
+function photoSatTint(tex,lat,lon){
+  try{
+    const c=document.createElement('canvas'); c.width=c.height=48;
+    const cx=c.getContext('2d');
+    cx.drawImage(tex.image,0,0,48,48);
+    const d=cx.getImageData(0,16,48,32).data;      // lower 2/3 = facade region
+    let r=0,g=0,b=0,n=0;
+    for(let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    r/=n; g/=n; b/=n;
+    const lum=0.299*r+0.587*g+0.114*b;
+    if(b>r+18&&b>g+8&&lum>150) return null;        // mostly open sky, not a facade
+    const sat=satPixel(lat,lon);                    // mosaic colour 0..1
+    const cc=ch=>clamp(ch,0.72,1.35);
+    return new THREE.Color(cc(sat.r*255/Math.max(r,8)),
+                           cc(sat.g*255/Math.max(g,8)),
+                           cc(sat.b*255/Math.max(b,8)));
+  }catch(e){ return new THREE.Color(1,1,1); }       // tainted canvas: apply as-is
+}
 async function applyObliqueFacades(b){
   const tok=$('mapToken').value.trim(); if(!tok) return;
   log('Mapillary: querying street-level imagery...','ai');
   try{
     const url=`https://graph.mapillary.com/images?access_token=${encodeURIComponent(tok)}`+
-      `&bbox=${b.W},${b.S},${b.E},${b.N}&fields=thumb_1024_url,computed_geometry&limit=100`;
+      `&bbox=${b.W},${b.S},${b.E},${b.N}`+
+      `&fields=thumb_1024_url,computed_geometry,computed_compass_angle,is_pano&limit=200`;
     const res=await fetch(url); const data=await res.json();
     if(data.error) throw new Error(data.error.message||'API error');
-    const imgs=(data.data||[]).map(d=>({url:d.thumb_1024_url,ll:d.computed_geometry&&d.computed_geometry.coordinates}))
+    const imgs=(data.data||[]).map(d=>({url:d.thumb_1024_url,
+      ll:d.computed_geometry&&d.computed_geometry.coordinates,
+      compass:typeof d.computed_compass_angle==='number'?d.computed_compass_angle:null,
+      pano:!!d.is_pano}))
       .filter(d=>d.url&&d.ll);
     if(!imgs.length) throw new Error('no street imagery in this zone');
-    log(`Mapillary: ${imgs.length} photos found - texturing facades...`,'ai');
+    log(`Mapillary: ${imgs.length} photos - matching facades by orientation...`,'ai');
     const cands=cityGroup.children.filter(m=>m.userData&&m.userData.h)
       .sort((a,c)=>c.userData.h-a.userData.h).slice(0,40);
     const loader=new THREE.TextureLoader(); loader.setCrossOrigin('anonymous');
-    let applied=0;
+    let applied=0, skyRejected=0; const used=new Map();
     for(const m of cands){
-      let best=null,bd=Infinity;
-      for(const im of imgs){
-        const dx=(im.ll[0]-m.userData.lon)*geoCtx.mPerLon;
-        const dz=(im.ll[1]-m.userData.lat)*M_LAT;
-        const d=dx*dx+dz*dz; if(d<bd){bd=d;best=im;}
+      let best=null,bs=0.55;                        // quality gate
+      for(const ph of imgs){
+        const s=scoreFacadePhoto(
+          {lat:m.userData.lat,lon:m.userData.lon,facadeAz:m.userData.facadeAz},ph,used);
+        if(s>bs){ bs=s; best=ph; }
       }
-      if(!best||bd>150*150) continue;
+      if(!best) continue;
       try{
         const tex=await new Promise((ok,no)=>loader.load(best.url,ok,undefined,no));
         tex.colorSpace=THREE.SRGBColorSpace;
         tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
+        const tint=photoSatTint(tex,m.userData.lat,m.userData.lon);
+        if(!tint){ skyRejected++; continue; }
         m.material=[m.material[0],
-          new THREE.MeshStandardMaterial({map:tex,roughness:.85,metalness:.05})];
+          new THREE.MeshStandardMaterial({map:tex,color:tint,roughness:.85,metalness:.05})];
+        used.set(best,(used.get(best)||0)+1);
         applied++;
       }catch(e){/* CORS or dead thumb - skip */}
     }
-    log(`Mapillary: photo facades applied to ${applied} buildings (experimental)`, applied?'ok':'err');
+    log(`Mapillary: oriented photo facades on ${applied} buildings`+
+      (skyRejected?` (${skyRejected} sky-shots rejected via satellite cross-check)`:''),
+      applied?'ok':'err');
   }catch(err){ log('Mapillary: '+err.message,'err'); }
 }
 

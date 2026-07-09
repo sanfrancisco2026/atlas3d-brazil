@@ -52,9 +52,20 @@ two offline data files. There is no server, no package.json, no bundler — open
    lowers height MAE; exit 0 = pass).
 6. Three.js extrudes footprints, applies satellite-projected roof UVs + procedural
    emissive facade textures, and renders with bloom/ACES tone mapping.
-7. Optional Mapillary street photos can retexture the tallest facades
-   (`applyObliqueFacades`, needs a user-supplied token; currently
-   nearest-photo-by-centroid — an open refinement candidate).
+7. Optional Mapillary street photos retexture the 40 tallest facades
+   (`applyObliqueFacades`, needs a user-supplied token). Photo selection is
+   orientation-aware (`scoreFacadePhoto`, pure + unit-tested): a photo
+   qualifies only if the camera is 3–140 m away, its compass bearing shows it
+   was aimed at the building (>75° off-axis is hard-disqualified), and it sits
+   near the normal of the building's dominant facade plane (`facadeAz` on
+   `mesh.userData`, from the longest footprint edge, computed in
+   `buildBuildings`). Panoramas get fixed view credit; a reuse penalty spreads
+   photos across buildings. Each applied photo is then cross-referenced
+   against the satellite mosaic (`photoSatTint`): sky-dominated shots are
+   rejected, and the facade material is colour-corrected toward the mosaic's
+   tones (clamped per-channel ratio) so photo walls match the scene's
+   lighting; a CORS-tainted canvas degrades to applying the photo untinted.
+   Tested by `test/facade_match.test.js` (14 geometry checks; exit 0 = pass).
 8. Routing uses public OSRM; geocoding uses public Nominatim.
 
 ## Credentials
@@ -77,10 +88,9 @@ No required API keys. All backing services are free/public:
     loader, HUD, stats, etc.
   - **(B) Differentiator feature** — something that meaningfully extends what
     the app can do. Done so far: Brazil + Goiás dataset merge; shadow-based
-    height estimation. Open candidates: improve `applyObliqueFacades` to pick
-    Mapillary photos by facade orientation and cross-reference the satellite
-    mosaic (colour/roof match) instead of nearest-centroid; new preset Goiás
-    municipalities; export/share of a built scene; offline-first fallback UX.
+    height estimation; orientation-aware Mapillary facades with satellite
+    cross-referencing. Open candidates: new preset Goiás municipalities;
+    export/share of a built scene; offline-first fallback UX.
 - This is a static app: keep it dependency-free and buildless unless a change
   genuinely requires tooling — prefer plain JS/CSS/HTML additions.
 - The two `atlas_local_*.js` files are large (28MB / 5.6MB) generated data
