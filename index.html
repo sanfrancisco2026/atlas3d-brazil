@@ -276,6 +276,10 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <input id="mapToken" type="password" placeholder="MLY|... (leave empty to skip)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
 
+    <label class="small">OpenAQ key (optional &mdash; live air quality)</label>
+    <input id="aqKey" type="password" placeholder="explore.openaq.org key (empty = estimate from OSM)"
+      style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
+
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
       is the area that will be reconstructed from OpenStreetMap footprints + Esri satellite imagery.</p>
@@ -304,6 +308,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <div class="stat"><span class="v" id="stTallest">0 m</span><span class="k">Tallest</span></div>
       <div class="stat"><span class="v" id="stRoads">0 km</span><span class="k">Road network</span></div>
       <div class="stat"><span class="v" id="stCoverage">0%</span><span class="k">OSM z-tagged</span></div>
+      <div class="stat"><span class="v" id="stAQ">&mdash;</span><span class="k">PM2.5 &micro;g/m&sup3;</span></div>
     </div>
 
     <div class="slider-row" style="margin-top:16px"><span>Planner layers (OSM open data)</span><b id="lyCount">...</b></div>
@@ -374,6 +379,8 @@ let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
 let trafficPaths = [], cars = [], trafficMeshes = [];
 let camAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
+let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
+    pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let downXY = null;
 let prevT = performance.now();
 
@@ -898,6 +905,7 @@ function buildShadowModel(prepared,lum){
 
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
+  pollutionCtx.stacks=[]; pollutionCtx.indArea=0;
   const roofMat=new THREE.MeshStandardMaterial({map:satData.texture,roughness:.8,metalness:.05});
   const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
   const halfW=sceneW/2, halfH=sceneH/2;
@@ -994,6 +1002,14 @@ function buildBuildings(osm){
     mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
       area:Math.round(p.area),
       src:p.tagged?'osm':(p.shadow?'shadow':'typo')};   // height provenance
+
+    // industrial sources feed the air-quality estimator + smoke plumes
+    const btype=(p.tags.building||'').toLowerCase();
+    if(btype==='industrial'||btype==='factory'||btype==='warehouse'||btype==='hangar'){
+      pollutionCtx.indArea+=p.area;
+      if(pollutionCtx.stacks.length<40&&(btype==='industrial'||btype==='factory'))
+        pollutionCtx.stacks.push({x:(p.sLon-cLon)*mPerLon, z:(cLat-p.sLat)*M_LAT, h});
+    }
     if(p.isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
     count++;
   });
@@ -1037,6 +1053,7 @@ function ribbonGeometry(points,width,y){
 }
 function buildRoads(osm){
   clearGroup(roadGroup); trafficPaths=[];
+  pollutionCtx.majorKm=0; pollutionCtx.minorKm=0;
   const {cLat,cLon,mPerLon}=geoCtx;
   let totalKm=0;
   osm.elements.forEach(el=>{
@@ -1049,6 +1066,7 @@ function buildRoads(osm){
     let len=0; for(let i=0;i<pts.length-1;i++) len+=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z);
     totalKm+=len/1000;
     const major=cls[1]===1;
+    if(major) pollutionCtx.majorKm+=len/1000; else pollutionCtx.minorKm+=len/1000;
     const mesh=new THREE.Mesh(ribbonGeometry(pts,cls[0],major?0.22:0.16),
       major?matRoadMajor:matRoadMinor);
     mesh.receiveShadow=true;
@@ -1189,6 +1207,131 @@ function updateTraffic(dt){
 }
 
 /* ============================================================
+   AIR QUALITY & POLLUTION (OpenAQ + OSM-derived fallback)
+   With a user key, live PM2.5 comes from OpenAQ stations near the
+   capture zone. Without one (or on any failure) we estimate it from
+   what the scene itself tells us: major/minor road density (vehicle
+   exhaust) and industrial footprint fraction (stationary sources).
+   The index then drives visible effects: smog-tinted fog, exhaust
+   haze hanging over major roads, and drifting smoke plumes rising
+   from industrial buildings.
+============================================================ */
+// Pure estimator (unit-tested): rd = km of road per km2, indFrac = fraction
+// of ground covered by industrial buildings. Tuned to typical urban PM2.5.
+function estimatePM25(ctx,areaKm2){
+  if(!(areaKm2>0)) return 6;
+  const rd=(ctx.majorKm*2+ctx.minorKm*0.5)/areaKm2;
+  const indFrac=Math.min(0.25,ctx.indArea/(areaKm2*1e6));
+  return clamp(6+rd*0.55+indFrac*160,3,90);
+}
+async function fetchAirQuality(b){
+  const key=$('aqKey').value.trim(); if(!key) return null;
+  try{
+    const H={headers:{'X-API-Key':key}};
+    const r=await fetch(`https://api.openaq.org/v3/locations?coordinates=${b.cLat},${b.cLon}&radius=15000&limit=20`,H);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const locs=(await r.json()).results||[];
+    const sensorParam={};                      // sensorsId -> parameter name
+    locs.forEach(l=>(l.sensors||[]).forEach(s=>{
+      sensorParam[s.id]=s.parameter&&s.parameter.name; }));
+    const vals=[];
+    for(const l of locs.slice(0,5)){
+      const lr=await fetch(`https://api.openaq.org/v3/locations/${l.id}/latest`,H);
+      if(!lr.ok) continue;
+      ((await lr.json()).results||[]).forEach(m=>{
+        const p=sensorParam[m.sensorsId];
+        if(p==='pm25'&&m.value>0) vals.push(m.value);
+        else if(p==='pm10'&&m.value>0) vals.push(m.value*0.5); // rough pm10->pm25
+      });
+    }
+    if(!vals.length) return null;
+    return {pm25:Math.round(_median(vals)*10)/10, label:'OpenAQ · '+vals.length+' readings'};
+  }catch(err){ log('OpenAQ: '+err.message+' - falling back to OSM estimate','err'); return null; }
+}
+function makePuffTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=64;
+  const x=c.getContext('2d');
+  const g=x.createRadialGradient(32,32,2,32,32,30);
+  g.addColorStop(0,'rgba(255,255,255,.85)'); g.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle=g; x.fillRect(0,0,64,64);
+  return new THREE.CanvasTexture(c);
+}
+function clearPollutionFX(){
+  if(pollGroup){ scene.remove(pollGroup);
+    pollGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    pollGroup=null; }
+  exhaustMat=smokeMat=smokeSys=null;
+}
+function buildPollutionFX(){
+  clearPollutionFX();
+  pollGroup=new THREE.Group();
+  const puff=makePuffTexture();
+  windDir=Math.random()*Math.PI*2;
+  // exhaust haze hovering over major roads
+  const ex=[];
+  trafficPaths.filter(p=>p.major).forEach(p=>{
+    for(let d=8;d<p.total&&ex.length<3600;d+=16){
+      const pt=pointOnPath(p,d);
+      ex.push(pt.x+(Math.random()-0.5)*7, 1.2+Math.random()*2.6, pt.z+(Math.random()-0.5)*7);
+    }
+  });
+  if(ex.length){
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.Float32BufferAttribute(ex,3));
+    exhaustMat=new THREE.PointsMaterial({map:puff,size:9,transparent:true,opacity:0,
+      color:0x9a9084,depthWrite:false});
+    pollGroup.add(new THREE.Points(g,exhaustMat));
+  }
+  // smoke plumes rising from industrial buildings
+  const stacks=pollutionCtx.stacks;
+  if(stacks.length){
+    const PER=22, n=stacks.length*PER;
+    const pos=new Float32Array(n*3), meta=new Float32Array(n*2); // phase, jitter
+    for(let i=0;i<n;i++){ meta[i*2]=Math.random(); meta[i*2+1]=Math.random()*Math.PI*2; }
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+    smokeMat=new THREE.PointsMaterial({map:puff,size:13,transparent:true,opacity:0,
+      color:0x8f8f96,depthWrite:false});
+    smokeSys={points:new THREE.Points(g,smokeMat),stacks,meta,per:PER,t:0};
+    smokeSys.points.frustumCulled=false;
+    pollGroup.add(smokeSys.points);
+  }
+  scene.add(pollGroup);
+}
+function updatePollution(dt){
+  if(!smokeSys) return;
+  smokeSys.t+=dt;
+  const pos=smokeSys.points.geometry.attributes.position;
+  const wx=Math.cos(windDir), wz=Math.sin(windDir);
+  for(let s=0;s<smokeSys.stacks.length;s++){
+    const st=smokeSys.stacks[s];
+    for(let j=0;j<smokeSys.per;j++){
+      const i=s*smokeSys.per+j;
+      const t=(smokeSys.meta[i*2]+smokeSys.t*0.045)%1;   // 0 = roof, 1 = dispersed
+      const ph=smokeSys.meta[i*2+1];
+      const rise=t*52, spread=2+t*14;
+      pos.setXYZ(i,
+        st.x+wx*rise*0.55+Math.sin(ph+t*7)*spread*0.4,
+        st.h+rise,
+        st.z+wz*rise*0.55+Math.cos(ph+t*7)*spread*0.4);
+    }
+  }
+  pos.needsUpdate=true;
+}
+async function applyAirQuality(b){
+  const areaKm2=(geoCtx.sceneW/1000)*(geoCtx.sceneH/1000);
+  const live=await fetchAirQuality(b);
+  aqState=live||{pm25:Math.round(estimatePM25(pollutionCtx,areaKm2)*10)/10,
+    label:'estimated from roads + industry (OSM)'};
+  $('stAQ').textContent=aqState.pm25;
+  buildPollutionFX();
+  applyAtmosphere();
+  log(`Air quality: PM2.5 ~${aqState.pm25} ug/m3 (${aqState.label})`,live?'ok':'ai');
+  if(pollutionCtx.stacks.length)
+    log(`${pollutionCtx.stacks.length} industrial smoke sources active`,'ai');
+}
+
+/* ============================================================
    ATMOSPHERE (time of day, fog, bloom, night lights)
 ============================================================ */
 function applyAtmosphere(){
@@ -1221,8 +1364,13 @@ function applyAtmosphere(){
   vehMats.forEach(m=>m.emissiveIntensity=0.3+night*2.6);
   if(lampGlowMat) lampGlowMat.emissiveIntensity=0.2+night*3.2;
 
-  scene.fog.density=0.00025+fogAmt*0.0035;
+  // pollution: smog thickens + browns the fog, haze/smoke fade in with it
+  const pol=aqState?clamp(aqState.pm25/60,0,1.2):0;
+  scene.fog.density=0.00025+fogAmt*0.0035+pol*0.0014;
   scene.fog.color.setHSL(0.6,0.3,0.04+0.5*day);
+  if(pol>0) scene.fog.color.lerp(new THREE.Color(0x8d7f66),Math.min(0.55,pol*(0.15+0.4*day)));
+  if(exhaustMat) exhaustMat.opacity=pol*(0.10+0.12*day);
+  if(smokeMat) smokeMat.opacity=pollutionCtx.stacks.length?Math.min(0.35,0.10+pol*0.18):0;
   bloomPass.strength=0.12+night*0.75+fogAmt*0.55;
   bloomPass.radius=0.25+fogAmt*0.5;
 }
@@ -1888,6 +2036,7 @@ $('buildBtn').addEventListener('click',async()=>{
     plannerClear();
     buildPlannerLayers(b);
     applyObliqueFacades(b);
+    applyAirQuality(b);
   }catch(err){
     console.error(err);
     log('Build failed: '+err.message,'err');
@@ -1904,6 +2053,7 @@ $('resetBtn').addEventListener('click',()=>{
   $('synBtn').textContent='Synthetic infill: ON';
   plannerClear();
   removeTraffic();
+  clearPollutionFX(); aqState=null; $('stAQ').innerHTML='&mdash;';
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
   $('viewOrbit').classList.remove('active-mode');
@@ -1923,7 +2073,7 @@ function animate(){
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt);
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
