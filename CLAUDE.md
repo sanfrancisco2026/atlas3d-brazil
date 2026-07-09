@@ -9,15 +9,21 @@ two offline data files. There is no server, no package.json, no bundler — open
 - `index.html` — the entire app: CSS, UI panel, and the module `<script type="module">`
   at the bottom containing all logic (map picking, OSM fetch, satellite tiling,
   height extrapolation, Three.js scene construction, animation loop).
-- `atlas_local_brazil.js` — offline Geofabrik Brazil extract (ODbL), assigns
-  `window.ATLAS_LOCAL = {source, areas: [...]}`. Loaded via `<script>` tag before
-  the module script, so `window.ATLAS_LOCAL` is available when `localOSM()` runs.
+- `atlas_local_brazil.js` — offline Geofabrik Brazil-wide extract (ODbL), assigns
+  `window.ATLAS_LOCAL = {source, areas: [...]}` (53 named areas across all of
+  Brazil, including 17 Goiás-state municipalities).
 - `atlas_local_goias.js` — offline Geofabrik centro-oeste/Goiás extract, same
-  shape (`window.ATLAS_LOCAL = {...}`). **Not currently wired into `index.html`.**
-  Loading it after `atlas_local_brazil.js` would *overwrite* `window.ATLAS_LOCAL`
-  rather than merge with it — the two files are drop-in alternatives today, not
-  additive. Merging them into one combined `areas` array (Goiás detail + Brazil
-  coverage elsewhere) is an open differentiator-feature candidate.
+  shape, covering those same 17 Goiás-area names as a dedicated regional source.
+- Both scripts are `defer`red and loaded in a fixed order, with two small inline
+  `<script defer>` snippets in between/after them in `index.html`'s `<head>`
+  that snapshot `window.ATLAS_LOCAL` after the Brazil script runs (into
+  `window.ATLAS_LOCAL_BRAZIL`), then, once the Goiás script runs and overwrites
+  `window.ATLAS_LOCAL`, merge the two: Goiás's 17 areas take precedence (by
+  name), and every other Brazil-wide area is concatenated in as fallback
+  coverage. Relative execution order of deferred classic scripts matches
+  document order, so this merge is guaranteed to run after both datasets have
+  loaded and before the `type="module"` script (also implicitly deferred) that
+  calls `localOSM()`.
 
 ### Data flow
 1. User searches (Nominatim) or clicks the 2D Leaflet map to pick a capture zone.
@@ -51,9 +57,9 @@ No required API keys. All backing services are free/public:
   - **(A) UX polish** — visual/interaction refinement of the existing panel,
     loader, HUD, stats, etc.
   - **(B) Differentiator feature** — something that meaningfully extends what
-    the app can do (e.g. merging the Brazil + Goiás datasets, adding new preset
-    Goiás municipalities, offline-first fallback UX, export/share of a built
-    scene, etc.)
+    the app can do (e.g. adding new preset Goiás municipalities, offline-first
+    fallback UX, export/share of a built scene, etc. — the Brazil + Goiás
+    dataset merge described above is already done)
 - This is a static app: keep it dependency-free and buildless unless a change
   genuinely requires tooling — prefer plain JS/CSS/HTML additions.
 - The two `atlas_local_*.js` files are large (28MB / 5.6MB) generated data

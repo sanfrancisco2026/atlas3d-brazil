@@ -132,10 +132,28 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 }}
 </script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<!-- Optional offline dataset (Geofabrik extract, 28MB). Deferred so its download/parse
-     never blocks first paint of the panel + map; it's only read later, when Build is
-     clicked, so it's safe to finish loading in the background. -->
+<!-- Offline datasets (Geofabrik extracts). Deferred so their download/parse never
+     blocks first paint of the panel + map; they're only read later, when Build is
+     clicked, so it's safe to finish loading in the background.
+     Both files assign the same window.ATLAS_LOCAL global, so we snapshot the
+     Brazil-wide set, then merge in the dedicated Goias/centro-oeste extract with
+     precedence (its areas share names/bounds with 17 of the Brazil-wide ones, and
+     it's the more specific source for them) while keeping every other Brazil-wide
+     area (Sao Paulo, Rio, Salvador, ...) as a fallback. -->
 <script src="atlas_local_brazil.js" defer></script>
+<script defer>window.ATLAS_LOCAL_BRAZIL = window.ATLAS_LOCAL;</script>
+<script src="atlas_local_goias.js" defer></script>
+<script defer>
+  (function(){
+    var goias = window.ATLAS_LOCAL, brazil = window.ATLAS_LOCAL_BRAZIL;
+    if (!goias || !brazil) return; // one of the datasets failed to load; keep whichever loaded
+    var goiasNames = new Set(goias.areas.map(function(a){ return a.name; }));
+    window.ATLAS_LOCAL = {
+      source: goias.source + ' + ' + brazil.source,
+      areas: goias.areas.concat(brazil.areas.filter(function(a){ return !goiasNames.has(a.name); }))
+    };
+  })();
+</script>
 </head>
 
 <body>
