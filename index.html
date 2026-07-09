@@ -784,14 +784,100 @@ function collectBuildingFootprints(osm){
   return out;
 }
 
+/* ============================================================
+   SHADOW-BASED HEIGHT ESTIMATION (nadir photogrammetry)
+   OSM often has no height/levels for a building, so today those get a
+   coarse typology guess. But the stitched satellite mosaic already
+   contains each building's cast SHADOW, and shadow length L relates to
+   height H by  H = L * tan(sunElevation).  We don't know the imagery's
+   sun elevation (it's whatever date/time Esri captured the tile), so we
+   SELF-CALIBRATE: buildings that DO carry an OSM height act as ground
+   control points. We find the shadow azimuth + tan(elevation) that best
+   explains their known heights, then apply that model to untagged
+   buildings. Everything degrades silently to the old typology guess
+   when imagery is missing or the calibration is too weak to trust, so
+   this can never make the result worse than before.
+============================================================ */
+function _median(a){ if(!a.length) return NaN; const s=a.slice().sort((x,y)=>x-y);
+  const m=s.length>>1; return s.length%2?s[m]:(s[m-1]+s[m])/2; }
+function _pearson(xs,ys){ const n=xs.length; if(n<3) return 0;
+  let sx=0,sy=0,sxx=0,syy=0,sxy=0;
+  for(let i=0;i<n;i++){ const x=xs[i],y=ys[i]; sx+=x;sy+=y;sxx+=x*x;syy+=y*y;sxy+=x*y; }
+  const cov=n*sxy-sx*sy, dx=n*sxx-sx*sx, dy=n*syy-sy*sy;
+  const den=Math.sqrt(dx*dy); return den>1e-9?cov/den:0; }
+
+// luminance 0..255 of the satellite mosaic at a lat/lon, NaN if off-image
+function satLum(lat,lon){
+  if(!satData||!geoCtx) return NaN;
+  const u=(lon-geoCtx.W)/(geoCtx.E-geoCtx.W);
+  const v=1-(lat-geoCtx.S)/(geoCtx.N-geoCtx.S);
+  if(u<0||u>1||v<0||v>1) return NaN;
+  const x=Math.min(satData.w-1,Math.floor(u*satData.w));
+  const y=Math.min(satData.h-1,Math.floor(v*satData.h));
+  const i=(y*satData.w+x)*4, d=satData.imgData.data;
+  return 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+}
+
+// Walk out from a footprint along azimuth `az` and measure the contiguous
+// dark (shadow) run in metres. `lum(lat,lon)` is injectable for testing.
+function measureShadow(sLat,sLon,radiusM,az,lum){
+  lum=lum||satLum;
+  const cA=Math.cos(az), sA=Math.sin(az), mPerLon=geoCtx.mPerLon;
+  const step=2, start=radiusM+3, maxM=150;
+  // reference brightness: median of samples on the sun-facing (opposite) side
+  const refs=[];
+  for(let s=start;s<start+16;s+=4){
+    const r=lum(sLat-(cA*s)/M_LAT, sLon-(sA*s)/mPerLon);
+    if(!isNaN(r)) refs.push(r);
+  }
+  const ref=_median(refs); if(isNaN(ref)) return {len:0,contrast:0};
+  const thr=Math.min(ref*0.62,105);
+  let len=0, darkSum=0, darkN=0, bright=0;
+  for(let s=start;s<maxM;s+=step){
+    const l=lum(sLat+(cA*s)/M_LAT, sLon+(sA*s)/mPerLon);
+    if(isNaN(l)) break;
+    if(l<thr){ len=s-start+step; darkSum+=l; darkN++; bright=0; }
+    else if(++bright>=2) break;   // two consecutive lit samples end the shadow
+  }
+  const meanDark=darkN?darkSum/darkN:ref;
+  return {len:Math.max(0,len), contrast:ref>1?clamp((ref-meanDark)/ref,0,1):0};
+}
+
+// Calibrate an {az,k} model from prepared footprints; null when untrustworthy.
+function buildShadowModel(prepared,lum){
+  lum=lum||satLum;
+  let control=prepared.filter(p=>p.tagged&&p.knownH>4);
+  if(control.length<6) return null;
+  control=control.slice().sort((a,b)=>b.area-a.area).slice(0,120); // clearest shadows
+  const AZN=16;
+  let bestAz=null,bestCorr=0,bestPairs=null;
+  for(let i=0;i<AZN;i++){
+    const az=i/AZN*Math.PI*2, H=[],L=[];
+    for(const p of control){
+      const m=measureShadow(p.sLat,p.sLon,p.radius,az,lum);
+      if(m.len>2){ H.push(p.knownH); L.push(m.len); }
+    }
+    if(L.length<Math.max(5,control.length*0.4)) continue;
+    const corr=_pearson(L,H);
+    if(corr>bestCorr){ bestCorr=corr; bestAz=az; bestPairs={H,L}; }
+  }
+  if(bestAz===null||bestCorr<0.4) return null;
+  const ratios=bestPairs.H.map((h,i)=>h/bestPairs.L[i]).filter(r=>r>0.2&&r<8);
+  const k=_median(ratios);
+  if(!(k>0.1&&k<8)) return null;
+  return { az:bestAz, k, corr:bestCorr, n:ratios.length,
+           elevDeg:Math.atan(k)*180/Math.PI, lum };
+}
+
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
   const roofMat=new THREE.MeshStandardMaterial({map:satData.texture,roughness:.8,metalness:.05});
   const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
   const halfW=sceneW/2, halfH=sceneH/2;
   const feet=collectBuildingFootprints(osm);
-  let count=0, tallest=0, tagged=0, synCount=0;
 
+  // ---- pass 1: geometry, centroid, area, first-guess (typology) height ----
+  const prepared=[];
   feet.forEach(bld=>{
     const pts=[]; let sLat=0,sLon=0,n=0;
     bld.nodes.forEach(nid=>{
@@ -808,13 +894,43 @@ function buildBuildings(osm){
     area=Math.abs(area)/2;
     if(area<4) return;
 
+    // NOTE: rand is consumed by estimateHeight first, then again for the
+    // material variant below - same call order as before, so deterministic.
     const rand=mulberry32(bld.id>>>0);
     const est=estimateHeight(bld.tags,area,rand);
-    const h=est.h; if(est.tagged) tagged++;
-    const minH=clamp(parseLen(bld.tags.min_height)||0,0,h-1);
+    const minH=clamp(parseLen(bld.tags.min_height)||0,0,est.h-1);
+    prepared.push({ id:bld.id, tags:bld.tags, pts, area, sLat, sLon,
+      radius:Math.sqrt(area/Math.PI), typologyH:est.h, tagged:est.tagged,
+      knownH:est.tagged?est.h:0, minH, rand,
+      isSyn:bld.tags['atlas:synthetic']==='1' });
+  });
+
+  // ---- shadow calibration + refinement of untagged heights ----
+  const model=buildShadowModel(prepared);
+  let refined=0;
+  if(model){
+    for(const p of prepared){
+      if(p.tagged) continue;                          // trust real OSM z-data
+      const m=measureShadow(p.sLat,p.sLon,p.radius,model.az,model.lum);
+      if(m.len<=4||m.contrast<0.18) continue;          // no usable shadow here
+      const hShadow=clamp(m.len*model.k,3,650);
+      if(hShadow<p.typologyH*0.35||hShadow>p.typologyH*3.2) continue; // reject outliers
+      const w=clamp(m.contrast*model.corr,0,0.85);     // blend toward measurement
+      p.finalH=lerp(p.typologyH,hShadow,w);
+      p.shadow=true; refined++;
+    }
+    log(`Shadow model: sun elev ~${model.elevDeg.toFixed(0)}deg, ${model.n} OSM control pts (r=${model.corr.toFixed(2)})`,'ai');
+  }
+
+  // ---- pass 2: extrude ----
+  let count=0, tallest=0, tagged=0, synCount=0;
+  prepared.forEach(p=>{
+    const h=p.finalH||p.typologyH;
+    const minH=clamp(p.minH,0,h-1);
+    if(p.tagged) tagged++;
     tallest=Math.max(tallest,h);
 
-    const shape=new THREE.Shape(pts);
+    const shape=new THREE.Shape(p.pts);
     const geom=new THREE.ExtrudeGeometry(shape,{depth:h-minH,bevelEnabled:false});
     geom.rotateX(Math.PI/2); geom.translate(0,h,0);
 
@@ -826,20 +942,19 @@ function buildBuildings(osm){
       else uv.setXY(i,(x+zz)/14.4, y/14.4);
     }
     // vertex tint from satellite pixel at centroid; synthetic gets a cool cast
-    const isSyn=bld.tags['atlas:synthetic']==='1';
-    const tint=satPixel(sLat,sLon).lerp(new THREE.Color(1,1,1),0.45);
-    if(isSyn) tint.lerp(new THREE.Color(0.70,0.78,0.92),0.35);
+    const tint=satPixel(p.sLat,p.sLon).lerp(new THREE.Color(1,1,1),0.45);
+    if(p.isSyn) tint.lerp(new THREE.Color(0.70,0.78,0.92),0.35);
     const colors=new Float32Array(pos.count*3);
     for(let i=0;i<pos.count;i++){ colors[i*3]=tint.r; colors[i*3+1]=tint.g; colors[i*3+2]=tint.b; }
     geom.setAttribute('color',new THREE.BufferAttribute(colors,3));
 
     // material variant: glass for tall, masonry/concrete for the rest
     let variant;
-    if(h>55) variant=0; else if(rand()>0.5) variant=1; else variant=2;
+    if(h>55) variant=0; else if(p.rand()>0.5) variant=1; else variant=2;
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
-    mesh.userData={h,lat:sLat,lon:sLon};
-    if(isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
+    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow};
+    if(p.isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
     count++;
   });
 
@@ -849,7 +964,7 @@ function buildBuildings(osm){
   $('stTallest').textContent=Math.round(tallest)+' m';
   $('stCoverage').textContent=real?Math.round(tagged/real*100)+'%':'0%';
   $('synBtn').style.display=synCount?'block':'none';
-  log(`Extruded ${real} real footprints (${tagged} OSM z-tagged)`,'ok');
+  log(`Extruded ${real} real footprints (${tagged} OSM z-tagged`+(refined?`, ${refined} shadow-estimated`:'')+`)`,'ok');
   if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (procedural, landuse-derived)`,'ai');
 }
 

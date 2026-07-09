@@ -31,12 +31,31 @@ two offline data files. There is no server, no package.json, no bundler — open
    fall back to live Overpass API mirrors (`fetchOSM`) if no local area matches.
 3. Satellite imagery is stitched from Esri World_Imagery tiles directly into a
    canvas (CORS-safe, no proxy).
-4. Building heights are extrapolated from OSM tags (`estimateHeight`) when
-   explicit height/levels data is absent, using a typology table + deterministic
-   per-building jitter (`mulberry32` seeded PRNG keyed on OSM id).
-5. Three.js extrudes footprints, applies satellite-projected roof UVs + procedural
+4. Building heights come from OSM tags when present (`estimateHeight` →
+   `tagged:true` for explicit `height`/`building:levels`). When absent, a
+   typology table + deterministic per-building jitter (`mulberry32` seeded on
+   OSM id) gives a first guess, which is then **refined by shadow
+   photogrammetry** (see below) when the satellite imagery supports it.
+5. `buildBuildings` runs in two passes: pass 1 computes each footprint's
+   geometry/centroid/area/typology-height into a `prepared[]` array; then
+   `buildShadowModel` self-calibrates a shadow model against the OSM-tagged
+   buildings (ground-control points) — searching 16 azimuths for the one whose
+   measured shadow lengths best correlate with known heights, then taking
+   `k = tan(sunElevation) = median(height/shadowLength)`. Pass 2 extrudes,
+   nudging each *untagged* building's height toward `shadowLength * k`
+   (blended by measurement confidence, outliers rejected). It degrades
+   silently to the plain typology guess when there's no imagery, too few
+   control points (<6), or weak correlation (<0.4) — so it is strictly
+   non-regressive. Core is unit-tested by `test/shadow_height.test.js` (run
+   `node test/shadow_height.test.js`; a synthetic luminance field with known
+   truth — asserts calibration recovers azimuth+elevation and refinement
+   lowers height MAE; exit 0 = pass).
+6. Three.js extrudes footprints, applies satellite-projected roof UVs + procedural
    emissive facade textures, and renders with bloom/ACES tone mapping.
-6. Routing uses public OSRM; geocoding uses public Nominatim.
+7. Optional Mapillary street photos can retexture the tallest facades
+   (`applyObliqueFacades`, needs a user-supplied token; currently
+   nearest-photo-by-centroid — an open refinement candidate).
+8. Routing uses public OSRM; geocoding uses public Nominatim.
 
 ## Credentials
 
@@ -57,9 +76,11 @@ No required API keys. All backing services are free/public:
   - **(A) UX polish** — visual/interaction refinement of the existing panel,
     loader, HUD, stats, etc.
   - **(B) Differentiator feature** — something that meaningfully extends what
-    the app can do (e.g. adding new preset Goiás municipalities, offline-first
-    fallback UX, export/share of a built scene, etc. — the Brazil + Goiás
-    dataset merge described above is already done)
+    the app can do. Done so far: Brazil + Goiás dataset merge; shadow-based
+    height estimation. Open candidates: improve `applyObliqueFacades` to pick
+    Mapillary photos by facade orientation and cross-reference the satellite
+    mosaic (colour/roof match) instead of nearest-centroid; new preset Goiás
+    municipalities; export/share of a built scene; offline-first fallback UX.
 - This is a static app: keep it dependency-free and buildless unless a change
   genuinely requires tooling — prefer plain JS/CSS/HTML additions.
 - The two `atlas_local_*.js` files are large (28MB / 5.6MB) generated data
