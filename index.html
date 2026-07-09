@@ -357,6 +357,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ============================================================
    GLOBALS
@@ -370,9 +371,9 @@ let geoCtx = null;              // {cLat,cLon,mPerLon,W,E,S,N,sceneW,sceneH}
 let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
-let trafficPaths = [], cars = [];
+let trafficPaths = [], cars = [], trafficMeshes = [];
 let camAnim = null;
-let matRoadMajor, matRoadMinor, matCar, wallMats = [];
+let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
 let downXY = null;
 let prevT = performance.now();
 
@@ -768,7 +769,10 @@ function buildSharedMaterials(){
     emissiveIntensity:0.05,roughness:.9,transparent:true,opacity:.92,side:THREE.DoubleSide});
   matRoadMinor=new THREE.MeshStandardMaterial({color:0x14161c,emissive:0xffc36b,
     emissiveIntensity:0.03,roughness:.9,transparent:true,opacity:.85,side:THREE.DoubleSide});
-  matCar=new THREE.MeshStandardMaterial({color:0x0e0e12,emissive:0xfff6d8,emissiveIntensity:.35});
+  // white base colour so per-instance paint colours (setColorAt) show true
+  vehMats=VEH_TYPES.map(()=>new THREE.MeshStandardMaterial({color:0xffffff,
+    metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35}));
+  matCar=vehMats[0];
 }
 
 /* ============================================================
@@ -1053,7 +1057,7 @@ function buildRoads(osm){
       // cumulative distances for traffic animation
       const cum=[0]; for(let i=0;i<pts.length-1;i++)
         cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
-      trafficPaths.push({pts,cum,total:len});
+      trafficPaths.push({pts,cum,total:len,major});   // buses stick to major roads
     }
   });
   $('stRoads').textContent=totalKm.toFixed(1)+' km';
@@ -1091,19 +1095,68 @@ function buildTrees(osm){
   log(`Planted ${N} OSM-mapped trees`,'ok');
 }
 
-/* ---- ambient traffic ---- */
+/* ---- ambient traffic ----
+   Mixed fleet (cars / motorcycles / buses) with per-instance paint colours,
+   right-hand lane discipline (vehicles drive offset to the right of the way
+   centreline, so opposing directions pass instead of overlapping), and
+   per-class speeds. Buses only run on major roads. */
+const VEH_TYPES=[
+  {key:'car',  dims:[1.75,1.05,4.1], cabin:[1.58,0.72,2.0,-0.25], share:0.72,
+   vMin:7,  vMax:14,  lane:1.9, majorOnly:false},
+  {key:'moto', dims:[0.65,0.95,2.0], cabin:null,                  share:0.16,
+   vMin:9,  vMax:17,  lane:1.1, majorOnly:false},
+  {key:'bus',  dims:[2.5,2.9,11.4],  cabin:null,                  share:0.12,
+   vMin:5.5,vMax:8.5, lane:2.3, majorOnly:true},
+];
+// Brazilian fleet skews heavily white/silver
+const VEH_PAINT=[[0xf2f2f2,.32],[0xc9ccd2,.24],[0x7a7f87,.12],[0x14161a,.12],
+  [0x8e1f1f,.09],[0x1e3a6e,.06],[0xd9a70d,.03],[0x2e5e35,.02]];
+function pickPaint(){
+  let r=Math.random();
+  for(const [c,w] of VEH_PAINT){ if((r-=w)<=0) return c; }
+  return 0xf2f2f2;
+}
+// Right-hand lane offset, pure (unit-tested): facing = path yaw flipped when
+// travelling the way backwards; right vector = facing rotated -90deg about Y.
+function laneOffset(yaw,dir,laneW){
+  const face=yaw+(dir<0?Math.PI:0);
+  return {ox:-Math.cos(face)*laneW, oz:Math.sin(face)*laneW};
+}
+function vehicleGeometry(t){
+  const [w,h,l]=t.dims;
+  const body=new THREE.BoxGeometry(w,h,l); body.translate(0,h/2,0);
+  if(!t.cabin) return body;
+  const [cw,ch,cl,cz]=t.cabin;
+  const cab=new THREE.BoxGeometry(cw,ch,cl); cab.translate(0,h+ch/2-0.14,cz);
+  return mergeGeometries([body,cab]);
+}
+function removeTraffic(){
+  trafficMeshes.forEach(m=>{ scene.remove(m); m.geometry.dispose(); });
+  trafficMeshes=[]; trafficMesh=null; cars=[];
+}
 function buildTraffic(){
-  if(trafficMesh){ scene.remove(trafficMesh); trafficMesh.geometry.dispose(); trafficMesh=null; }
-  cars=[];
+  removeTraffic();
   if(!trafficPaths.length) return;
-  const N=Math.min(170,trafficPaths.length*3);
-  trafficMesh=new THREE.InstancedMesh(new THREE.BoxGeometry(1.7,1.1,3.8),matCar,N);
-  trafficMesh.castShadow=true;
-  for(let i=0;i<N;i++){
-    const p=trafficPaths[Math.floor(Math.random()*trafficPaths.length)];
-    cars.push({path:p, d:Math.random()*p.total, v:6+Math.random()*8, dir:Math.random()>.5?1:-1});
-  }
-  scene.add(trafficMesh);
+  const majors=trafficPaths.filter(p=>p.major);
+  const N=Math.min(190,trafficPaths.length*3);
+  const col=new THREE.Color();
+  VEH_TYPES.forEach((t,ti)=>{
+    const pool=t.majorOnly?majors:trafficPaths;
+    if(!pool.length) return;
+    const n=Math.max(1,Math.round(N*t.share));
+    const mesh=new THREE.InstancedMesh(vehicleGeometry(t),vehMats[ti],n);
+    mesh.castShadow=true;
+    for(let i=0;i<n;i++){
+      const p=pool[Math.floor(Math.random()*pool.length)];
+      cars.push({path:p, d:Math.random()*p.total,
+        v:t.vMin+Math.random()*(t.vMax-t.vMin),
+        dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, pool});
+      mesh.setColorAt(i,col.setHex(t.key==='bus'?0xd97a1a:pickPaint()));
+    }
+    if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
+    trafficMeshes.push(mesh); scene.add(mesh);
+  });
+  trafficMesh=trafficMeshes[0]||null;   // legacy handle used by reset guard
 }
 const _cm=new THREE.Matrix4(), _cq=new THREE.Quaternion(), _cs=new THREE.Vector3(1,1,1),
       _ce=new THREE.Euler(), _cp=new THREE.Vector3();
@@ -1115,22 +1168,24 @@ function pointOnPath(p,d){
   return {x:a.x+(b.x-a.x)*t, z:a.z+(b.z-a.z)*t, yaw:Math.atan2(b.x-a.x,b.z-a.z)};
 }
 function updateTraffic(dt){
-  if(!trafficMesh) return;
+  if(!trafficMeshes.length) return;
   for(let i=0;i<cars.length;i++){
     const c=cars[i];
     c.d+=c.v*dt*c.dir;
     if(c.d>=c.path.total||c.d<=0){
-      c.path=trafficPaths[Math.floor(Math.random()*trafficPaths.length)];
+      c.path=c.pool[Math.floor(Math.random()*c.pool.length)];
       c.dir=Math.random()>.5?1:-1;
       c.d=c.dir>0?0.1:c.path.total-0.1;
     }
     const p=pointOnPath(c.path,c.d);
-    _ce.set(0,p.yaw+(c.dir<0?Math.PI:0),0);
+    const face=p.yaw+(c.dir<0?Math.PI:0);
+    const lo=laneOffset(p.yaw,c.dir,c.lane);
+    _ce.set(0,face,0);
     _cq.setFromEuler(_ce);
-    _cm.compose(_cp.set(p.x,0.75,p.z),_cq,_cs);
-    trafficMesh.setMatrixAt(i,_cm);
+    _cm.compose(_cp.set(p.x+lo.ox,0.05,p.z+lo.oz),_cq,_cs);
+    trafficMeshes[c.ti].setMatrixAt(c.mi,_cm);
   }
-  trafficMesh.instanceMatrix.needsUpdate=true;
+  trafficMeshes.forEach(m=>m.instanceMatrix.needsUpdate=true);
 }
 
 /* ============================================================
@@ -1163,7 +1218,7 @@ function applyAtmosphere(){
   wallMats.forEach(m=>m.emissiveIntensity=night*1.5);
   matRoadMajor.emissiveIntensity=0.05+night*1.1;
   matRoadMinor.emissiveIntensity=0.03+night*0.55;
-  matCar.emissiveIntensity=0.3+night*2.6;
+  vehMats.forEach(m=>m.emissiveIntensity=0.3+night*2.6);
   if(lampGlowMat) lampGlowMat.emissiveIntensity=0.2+night*3.2;
 
   scene.fog.density=0.00025+fogAmt*0.0035;
@@ -1848,7 +1903,7 @@ $('resetBtn').addEventListener('click',()=>{
   clearGroup(synGroup); synGroup.visible=true;
   $('synBtn').textContent='Synthetic infill: ON';
   plannerClear();
-  if(trafficMesh){ scene.remove(trafficMesh); trafficMesh=null; }
+  removeTraffic();
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
   $('viewOrbit').classList.remove('active-mode');
