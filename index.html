@@ -307,6 +307,10 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <button id="routeBtn" class="gold" style="margin-top:14px">&#9673; Plot Route (OSRM)</button>
     <div id="routeInfo"></div>
     <button id="synBtn" class="ghost" style="display:none">Synthetic infill: ON</button>
+    <div class="btn-row">
+      <button id="shotBtn" class="ghost">&#128247; Postcard</button>
+      <button id="glbBtn" class="ghost">&#11015; 3D model (.glb)</button>
+    </div>
 
     <div id="stats" style="display:grid">
       <div class="stat"><span class="v" id="stBuildings">0</span><span class="k">Real buildings</span></div>
@@ -369,6 +373,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 
 /* ============================================================
    GLOBALS
@@ -1218,6 +1223,88 @@ function updateTraffic(dt){
   }
   trafficMeshes.forEach(m=>m.instanceMatrix.needsUpdate=true);
 }
+
+/* ============================================================
+   EXPORT & SHARE (postcard PNG + GLB 3D model)
+   Postcard: re-render at up to 2x resolution, composite a caption bar
+   (place, clock, ATLAS-3D brand, and the OSM/Esri attribution the
+   tile licences require), download as PNG. GLB: the whole built city
+   (ground, buildings, roads, trees, lamps - not transient traffic)
+   through three's GLTFExporter, openable in Blender & co.
+============================================================ */
+// Pure (unit-tested): filesystem-safe slug from a place name.
+function slugify(s){
+  return (s||'scene').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,48)||'scene';
+}
+// Pure (unit-tested): supersampling factor that keeps both dimensions
+// under maxDim; never below native (1) and never beyond 2x.
+function fitExportScale(w,h,maxDim){
+  return clamp(Math.min(maxDim/w,maxDim/h),1,2);
+}
+function downloadBlob(name,blob){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+}
+function restoreRenderSize(){
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(innerWidth,innerHeight,false);
+  composer.setSize(innerWidth,innerHeight);
+}
+function exportPostcard(){
+  if(appState!=='city') return;
+  const btn=$('shotBtn'); btn.disabled=true;
+  try{
+    const w=innerWidth,h=innerHeight,s=fitExportScale(w,h,4096);
+    renderer.setPixelRatio(1);
+    renderer.setSize(Math.round(w*s),Math.round(h*s),false);
+    composer.setSize(Math.round(w*s),Math.round(h*s));
+    composer.render();                       // fresh frame, same tick as capture
+    const BAR=Math.round(64*s);
+    const shot=document.createElement('canvas');
+    shot.width=Math.round(w*s); shot.height=Math.round(h*s)+BAR;
+    const cx=shot.getContext('2d');
+    cx.drawImage(renderer.domElement,0,0);
+    cx.fillStyle='#060a12'; cx.fillRect(0,shot.height-BAR,shot.width,BAR);
+    const mid=shot.height-BAR/2;
+    cx.textBaseline='middle';
+    cx.fillStyle='#4facfe'; cx.font=`700 ${Math.round(20*s)}px 'Segoe UI',system-ui,sans-serif`;
+    cx.fillText('ATLAS-3D',Math.round(18*s),mid);
+    cx.fillStyle='#dfe7f2'; cx.font=`${Math.round(15*s)}px 'Segoe UI',system-ui,sans-serif`;
+    cx.fillText(`${geoCtx.placeName||''}  ·  ${$('timeVal').textContent}`,Math.round(140*s),mid);
+    cx.fillStyle='#7d8aa0'; cx.font=`${Math.round(11*s)}px 'Segoe UI',system-ui,sans-serif`;
+    cx.textAlign='right';
+    cx.fillText('© OpenStreetMap contributors · Imagery © Esri',
+      shot.width-Math.round(14*s),mid);
+    restoreRenderSize();
+    shot.toBlob(b=>{
+      downloadBlob(`atlas3d_${slugify(geoCtx.placeName)}.png`,b);
+      log('Postcard exported','ok');
+    },'image/png');
+  }catch(err){ restoreRenderSize(); log('Postcard failed: '+err.message,'err'); }
+  finally{ btn.disabled=false; }
+}
+function exportGLB(){
+  if(appState!=='city') return;
+  const btn=$('glbBtn');
+  const idle=()=>{ btn.disabled=false; btn.innerHTML='&#11015; 3D model (.glb)'; };
+  btn.disabled=true; btn.textContent='Exporting...';
+  log('Building GLB (can take a few seconds)...','ai');
+  try{
+    const parts=[groundMesh,cityGroup,synGroup,roadGroup,treeGroup,lampGroup].filter(Boolean);
+    new GLTFExporter().parse(parts,
+      res=>{
+        downloadBlob(`atlas3d_${slugify(geoCtx.placeName)}.glb`,
+          new Blob([res],{type:'model/gltf-binary'}));
+        log(`GLB exported (${(res.byteLength/1048576).toFixed(1)} MB)`,'ok'); idle();
+      },
+      err=>{ log('GLB export failed: '+(err&&err.message||err),'err'); idle(); },
+      {binary:true,onlyVisible:true});
+  }catch(err){ log('GLB export failed: '+err.message,'err'); idle(); }
+}
+$('shotBtn').addEventListener('click',exportPostcard);
+$('glbBtn').addEventListener('click',exportGLB);
 
 /* ============================================================
    STREET LIGHTS & NIGHT CALIBRATION
@@ -2137,6 +2224,8 @@ $('buildBtn').addEventListener('click',async()=>{
 
     const local=localOSM(b);
     if(local) log('OFFLINE MODE: local Geofabrik dataset - '+local.name,'ok');
+    geoCtx.placeName=(local&&local.name)||$('searchInput').value.trim()
+      ||`${b.cLat.toFixed(4)}, ${b.cLon.toFixed(4)}`;
     const [osm,sat]=await Promise.all([
       local?Promise.resolve(local.data):fetchOSM(b),
       fetchSatellite(b)]);

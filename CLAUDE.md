@@ -84,6 +84,12 @@ two offline data files. There is no server, no package.json, no bundler — open
    builds a PMREM environment from the procedural sky so glass-variant towers
    (h>55, or >38 with probability) get real glazed reflections when no photo
    data is available; regenerated when the time slider is released.
+13. Export: `exportPostcard` re-renders at up to 2x (`fitExportScale`, pure,
+   tested) and composites a caption bar (place name from `geoCtx.placeName`,
+   clock, OSM/Esri attribution) into a downloaded PNG; `exportGLB` sends the
+   built scene (ground, buildings, roads, trees, lamps — not transient
+   traffic) through three's GLTFExporter as a binary .glb. Filenames via
+   `slugify` (pure, tested in `test/export_utils.test.js`).
 9. In the 3D view, clicking a building (outside route mode) opens an inspect
    card (`selectBuilding`/`hideBldCard`): height, estimated floors, footprint
    area, and height provenance — colour-coded OSM z-tag / shadow-measured /
@@ -116,8 +122,9 @@ No required API keys. All backing services are free/public:
   - **(B) Differentiator feature** — something that meaningfully extends what
     the app can do. Done so far: Brazil + Goiás dataset merge; shadow-based
     height estimation; orientation-aware Mapillary facades with satellite
-    cross-referencing. Open candidates: new preset Goiás municipalities;
-    export/share of a built scene; offline-first fallback UX.
+    cross-referencing; realistic traffic; OpenAQ pollution; night realism;
+    postcard + GLB export. Open candidates: new preset Goiás municipalities;
+    offline-first fallback UX; colour-coded AQ health bands.
 - This is a static app: keep it dependency-free and buildless unless a change
   genuinely requires tooling — prefer plain JS/CSS/HTML additions.
 - The two `atlas_local_*.js` files are large (28MB / 5.6MB) generated data
