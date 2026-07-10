@@ -280,6 +280,16 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <input id="aqKey" type="password" placeholder="explore.openaq.org key (empty = estimate from OSM)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
 
+    <label class="small">Time machine &mdash; historic satellite (NASA MODIS, 2000&rarr;)</label>
+    <input id="histDate" type="date" min="2000-02-24"
+      style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:8px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box;color-scheme:dark">
+    <div class="slider-row"><span>Overlay opacity</span><b id="histOpVal">70%</b></div>
+    <input type="range" id="histOp" min="10" max="100" step="5" value="70">
+    <div class="btn-row">
+      <button id="histBtn" class="ghost">Historic: OFF</button>
+      <button id="radarBtn" class="ghost">Live radar: OFF</button>
+    </div>
+
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
       is the area that will be reconstructed from OpenStreetMap footprints + Esri satellite imagery.</p>
@@ -365,7 +375,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Height source</span><b id="bcS">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
-<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra taxonomy &amp; voltage palette: OpenInfraMap</div>
+<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS</div>
 
 <!-- ================= LOADER ================= -->
 <div id="loader">
@@ -497,6 +507,77 @@ $('presetSelect').addEventListener('change',e=>{
   map.setView([+lat,+lon],17);
   log('Preset: '+name.join(','),'ok');
 });
+
+/* ---- time machine: dated NASA MODIS satellite overlay on the 2D map ---- */
+// Pure (unit-tested): GIBS WMTS template for a YYYY-MM-DD date
+function gibsUrl(date){
+  return 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/'+
+    `MODIS_Terra_CorrectedReflectance_TrueColor/default/${date}/`+
+    'GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg';
+}
+// Pure (unit-tested): cyclic frame advance for the radar animation
+function nextFrame(idx,len){ return len>0?(idx+1)%len:0; }
+let histLayer=null, radarState=null;
+function isoDaysAgo(n){ return new Date(Date.now()-n*864e5).toISOString().slice(0,10); }
+$('histDate').max=isoDaysAgo(2);          // GIBS lags ~a day behind
+$('histDate').value=isoDaysAgo(366);      // default: this week, one year ago
+function addHistLayer(){
+  histLayer=L.tileLayer(gibsUrl($('histDate').value),
+    {maxNativeZoom:9,maxZoom:19,opacity:+$('histOp').value/100,
+     attribution:'Historic imagery: NASA GIBS / MODIS Terra'});
+  histLayer.addTo(map);
+  $('histBtn').textContent='Historic: '+$('histDate').value;
+  $('histBtn').classList.add('active-mode');
+}
+$('histBtn').addEventListener('click',()=>{
+  if(histLayer){ map.removeLayer(histLayer); histLayer=null;
+    $('histBtn').textContent='Historic: OFF';
+    $('histBtn').classList.remove('active-mode'); return; }
+  addHistLayer();
+  log('Time machine: MODIS satellite for '+$('histDate').value,'ok');
+});
+$('histDate').addEventListener('change',()=>{
+  if(!histLayer) return;
+  map.removeLayer(histLayer); addHistLayer();
+});
+$('histOp').addEventListener('input',()=>{
+  $('histOpVal').textContent=$('histOp').value+'%';
+  if(histLayer) histLayer.setOpacity(+$('histOp').value/100);
+});
+
+/* ---- live animated precipitation radar (RainViewer) ---- */
+async function toggleRadar(){
+  if(radarState){
+    clearInterval(radarState.timer);
+    radarState.layers.forEach(l=>map.removeLayer(l));
+    radarState=null;
+    $('radarBtn').textContent='Live radar: OFF';
+    $('radarBtn').classList.remove('active-mode');
+    return;
+  }
+  try{
+    const res=await fetch('https://api.rainviewer.com/public/weather-maps.json');
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const j=await res.json();
+    const frames=((j.radar&&j.radar.past)||[]).slice(-8);
+    if(!frames.length) throw new Error('no radar frames');
+    const layers=frames.map(f=>L.tileLayer(
+      `${j.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`,
+      {opacity:0,attribution:'Radar: RainViewer'}).addTo(map));
+    let idx=layers.length-1;
+    layers[idx].setOpacity(0.65);
+    const timer=setInterval(()=>{
+      layers[idx].setOpacity(0);
+      idx=nextFrame(idx,layers.length);
+      layers[idx].setOpacity(0.65);
+    },600);
+    radarState={layers,timer};
+    $('radarBtn').textContent='Live radar: ON';
+    $('radarBtn').classList.add('active-mode');
+    log(`Live radar: ${frames.length} RainViewer frames animating`,'ok');
+  }catch(err){ log('Radar: '+err.message,'err'); }
+}
+$('radarBtn').addEventListener('click',toggleRadar);
 
 /* ============================================================
    DATA: OVERPASS (buildings, roads, trees)

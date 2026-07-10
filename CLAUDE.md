@@ -86,7 +86,18 @@ two offline data files. There is no server, no package.json, no bundler — open
    builds a PMREM environment from the procedural sky so glass-variant towers
    (h>55, or >38 with probability) get real glazed reflections when no photo
    data is available; regenerated when the time slider is released.
-13. Export: `exportPostcard` re-renders at up to 2x (`fitExportScale`, pure,
+13. Weather (`applyWeatherMode`): live Open-Meteo conditions animate the scene
+   (rain particles via `buildRain`/`updateRain`, wind steering smoke + rain
+   drift, cloud cover flattening light/turbidity in `applyAtmosphere`); month
+   mode aggregates the ERA5 archive 1980→last year (`monthAggregate`, pure)
+   into a monthly pattern, and the simulation-year slider replays observed
+   years or extrapolates by `linearTrend` (pure) past the archive. Tested in
+   `test/weather_trend.test.js`.
+14. 2D-map overlays: time machine (`gibsUrl`, pure) overlays dated NASA MODIS
+   true-color imagery (2000→, date picker + opacity, maxNativeZoom 9); live
+   radar toggle animates the last 8 RainViewer frames (`nextFrame`, pure).
+   Tested in `test/map_overlays.test.js`.
+15. Export: `exportPostcard` re-renders at up to 2x (`fitExportScale`, pure,
    tested) and composites a caption bar (place name from `geoCtx.placeName`,
    clock, OSM/Esri attribution) into a downloaded PNG; `exportGLB` sends the
    built scene (ground, buildings, roads, trees, lamps — not transient
@@ -105,7 +116,10 @@ No required API keys. All backing services are free/public:
 - Overpass API (several public mirrors, see `OVERPASS` array in the module script).
 - Esri ArcGIS World_Imagery tiles — public, no key.
 - OSRM public router — no key.
-- NASA GIBS (VIIRS Black Marble night-lights tiles) — public, no key.
+- NASA GIBS (VIIRS Black Marble night-lights + dated MODIS true-color
+  tiles for the time machine) — public, no key.
+- Open-Meteo (current weather + ERA5 archive back to 1980) — public, no key.
+- RainViewer (live precipitation radar frames) — public, no key.
 - **Mapillary access token** — optional, user-supplied at runtime via the
   "Mapillary token" password input in the UI (for real street-photo facades).
   Never hardcode a token in source; it's a per-session runtime input only.
