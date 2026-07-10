@@ -1431,6 +1431,13 @@ function estimatePM25(ctx,areaKm2){
   const indFrac=Math.min(0.25,ctx.indArea/(areaKm2*1e6));
   return clamp(6+rd*0.55+indFrac*160,3,90);
 }
+// Pure (unit-tested): EPA-style PM2.5 health band -> [label, css colour]
+function aqBand(pm){
+  if(pm<=12)   return ['Good','#00ff9d'];
+  if(pm<=35.4) return ['Moderate','#ffdb0d'];
+  if(pm<=55.4) return ['Sensitive','#ff9a3d'];
+  return ['Unhealthy','#ff4d5e'];
+}
 async function fetchAirQuality(b){
   const key=$('aqKey').value.trim(); if(!key) return null;
   try{
@@ -1530,10 +1537,14 @@ async function applyAirQuality(b){
   const live=await fetchAirQuality(b);
   aqState=live||{pm25:Math.round(estimatePM25(pollutionCtx,areaKm2)*10)/10,
     label:'estimated from roads + industry (OSM)'};
-  $('stAQ').textContent=aqState.pm25;
+  const band=aqBand(aqState.pm25);
+  const el=$('stAQ');
+  el.textContent=aqState.pm25;
+  el.style.color=band[1];
+  el.title=`${band[0]} · ${aqState.label}`;
   buildPollutionFX();
   applyAtmosphere();
-  log(`Air quality: PM2.5 ~${aqState.pm25} ug/m3 (${aqState.label})`,live?'ok':'ai');
+  log(`Air quality: PM2.5 ~${aqState.pm25} ug/m3 - ${band[0]} (${aqState.label})`,live?'ok':'ai');
   if(pollutionCtx.stacks.length)
     log(`${pollutionCtx.stacks.length} industrial smoke sources active`,'ai');
 }
@@ -2287,7 +2298,8 @@ $('resetBtn').addEventListener('click',()=>{
   $('synBtn').textContent='Synthetic infill: ON';
   plannerClear();
   removeTraffic();
-  clearPollutionFX(); aqState=null; $('stAQ').innerHTML='&mdash;';
+  clearPollutionFX(); aqState=null;
+  $('stAQ').innerHTML='&mdash;'; $('stAQ').style.color=''; $('stAQ').title='';
   removeLamps(); nightCalib=1;
   scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }

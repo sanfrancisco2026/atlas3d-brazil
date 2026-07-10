@@ -74,7 +74,9 @@ two offline data files. There is no server, no package.json, no bundler — open
    `#aqKey`) or falls back to `estimatePM25` (pure, tested) derived from road
    density + industrial footprint collected during build. PM2.5 drives smog
    fog tint/density, exhaust haze over major roads, and animated smoke plumes
-   from industrial buildings (`buildPollutionFX`/`updatePollution`).
+   from industrial buildings (`buildPollutionFX`/`updatePollution`). The HUD
+   stat is colour-coded by EPA-style health band (`aqBand`, pure, tested)
+   with the band + data source in its tooltip.
 12. Night: `buildStreetLamps` renders instanced lamps from OSM
    `highway=street_lamp` nodes (now part of the main Overpass query) or,
    offline/unmapped, derives them from the road network (`lampPositions`,

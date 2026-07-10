@@ -7,6 +7,12 @@ function estimatePM25(ctx,areaKm2){
   const indFrac=Math.min(0.25,ctx.indArea/(areaKm2*1e6));
   return clamp(6+rd*0.55+indFrac*160,3,90);
 }
+function aqBand(pm){
+  if(pm<=12)   return ['Good','#00ff9d'];
+  if(pm<=35.4) return ['Moderate','#ffdb0d'];
+  if(pm<=55.4) return ['Sensitive','#ff9a3d'];
+  return ['Unhealthy','#ff4d5e'];
+}
 
 let pass=0, fail=0;
 function check(name,cond,detail){
@@ -36,6 +42,18 @@ check('dense centre lands in a plausible urban band (12-45)', center>=12&&center
 const extreme=estimatePM25({...Z,majorKm:50,minorKm:200,indArea:5e6},0.49);
 check('estimate is capped at 90', extreme===90);
 check('never below 3', estimatePM25({...Z,majorKm:-99},0.49)>=3);
+
+console.log('=== aqBand health bands ===');
+check('12 is Good (boundary inclusive)', aqBand(12)[0]==='Good');
+check('12.1 tips to Moderate', aqBand(12.1)[0]==='Moderate');
+check('35.4 is Moderate (boundary inclusive)', aqBand(35.4)[0]==='Moderate');
+check('35.5 tips to Sensitive', aqBand(35.5)[0]==='Sensitive');
+check('55.4 is Sensitive (boundary inclusive)', aqBand(55.4)[0]==='Sensitive');
+check('55.5 tips to Unhealthy', aqBand(55.5)[0]==='Unhealthy');
+check('every band has a css colour', [0,20,45,70].every(v=>/^#[0-9a-f]{6}$/.test(aqBand(v)[1])));
+check('estimator output always lands in a defined band',
+  [estimatePM25(Z,0.49),estimatePM25({...Z,majorKm:50,indArea:5e6},0.49)]
+    .every(v=>typeof aqBand(v)[0]==='string'));
 
 console.log(fail===0?'ALL PASS ('+pass+' checks)':'FAIL ('+fail+')');
 process.exit(fail===0?0:1);
