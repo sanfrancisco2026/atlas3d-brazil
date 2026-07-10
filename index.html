@@ -295,6 +295,22 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button class="ghost td" data-h="17.5">Dusk</button>
       <button class="ghost td" data-h="21.5">Night</button>
     </div>
+
+    <div class="slider-row" style="margin-top:14px"><span>Weather (Open-Meteo)</span><b id="wxVal">&mdash;</b></div>
+    <select id="wxMonth">
+      <option value="live" selected>Live &mdash; right now</option>
+      <option value="1">January pattern</option><option value="2">February pattern</option>
+      <option value="3">March pattern</option><option value="4">April pattern</option>
+      <option value="5">May pattern</option><option value="6">June pattern</option>
+      <option value="7">July pattern</option><option value="8">August pattern</option>
+      <option value="9">September pattern</option><option value="10">October pattern</option>
+      <option value="11">November pattern</option><option value="12">December pattern</option>
+    </select>
+    <p class="hint" id="wxInfo" style="margin-top:6px"></p>
+    <div id="simWrap" style="display:none">
+      <div class="slider-row"><span>Simulation year</span><b id="simVal">&mdash;</b></div>
+      <input type="range" id="simSlider" min="1980" max="2035" step="1" value="2026">
+    </div>
     <div class="slider-row"><span>Atmosphere / mist</span><b id="fogVal">10%</b></div>
     <input type="range" id="fogSlider" min="0" max="100" step="1" value="10">
 
@@ -393,6 +409,7 @@ let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
+let weatherState=null, rainSys=null, climCache=null, simData=null;
 let downXY = null;
 let prevT = performance.now();
 
@@ -1414,6 +1431,172 @@ function refreshEnvironment(){
 }
 
 /* ============================================================
+   WEATHER (Open-Meteo - live, monthly patterns, historic trend)
+   "Live" mode pulls current conditions (no key, CORS-open) and
+   animates them in the scene: rain particles, wind steering the
+   smoke plumes and rain slant, cloud cover flattening the light.
+   Month mode aggregates the Open-Meteo ERA5 archive (1980->last
+   full year) into that month's typical pattern, and feeds the
+   per-year history to the simulation slider: pick any year to see
+   observed weather, or glide past today and get a linear-trend
+   prediction - the same month-climatology approach other geospatial
+   digital twins use for scenario layers.
+============================================================ */
+const WMO_LABEL={0:'clear',1:'mostly clear',2:'partly cloudy',3:'overcast',
+  45:'fog',48:'fog',51:'drizzle',53:'drizzle',55:'drizzle',
+  61:'light rain',63:'rain',65:'heavy rain',80:'showers',81:'showers',
+  82:'violent showers',95:'thunderstorm',96:'thunderstorm',99:'thunderstorm'};
+// Pure (unit-tested): daily archive rows -> per-year stats for one month
+function monthAggregate(times,temps,precips,month){
+  const by={};
+  for(let i=0;i<times.length;i++){
+    const y=+times[i].slice(0,4), m=+times[i].slice(5,7);
+    if(m!==month) continue;
+    const t=temps[i], p=precips[i];
+    if(t==null||p==null) continue;
+    (by[y]=by[y]||{year:y,tSum:0,pSum:0,n:0,wet:0});
+    by[y].tSum+=t; by[y].pSum+=p; by[y].n++; if(p>=1) by[y].wet++;
+  }
+  return Object.values(by).filter(r=>r.n>=20)   // needs most of the month
+    .map(r=>({year:r.year,tempMean:r.tSum/r.n,precipSum:r.pSum,wetFrac:r.wet/r.n}))
+    .sort((a,b)=>a.year-b.year);
+}
+// Pure (unit-tested): least-squares line through {x,y} pairs
+function linearTrend(pairs){
+  const n=pairs.length; if(n<3) return null;
+  let sx=0,sy=0,sxx=0,sxy=0;
+  for(const [x,y] of pairs){ sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; }
+  const den=n*sxx-sx*sx; if(Math.abs(den)<1e-9) return null;
+  const slope=(n*sxy-sx*sy)/den, intercept=(sy-slope*sx)/n;
+  return {slope,intercept,predict:x=>slope*x+intercept};
+}
+// Pure (unit-tested): daily-precip mm -> rain visual intensity 0..1
+function rainIntensity(precipMm){ return clamp(precipMm/12,0,1); }
+async function fetchLiveWeather(lat,lon){
+  const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`+
+    `&current=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,cloud_cover,weather_code`);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const c=(await r.json()).current;
+  return {tempC:c.temperature_2m, precip:c.precipitation, windKmh:c.wind_speed_10m,
+    windDeg:c.wind_direction_10m, cloud:c.cloud_cover, code:c.weather_code};
+}
+async function fetchClimatology(lat,lon){
+  if(climCache) return climCache;
+  const lastYear=new Date().getFullYear()-1;
+  const r=await fetch(`https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}`+
+    `&start_date=1980-01-01&end_date=${lastYear}-12-31`+
+    `&daily=temperature_2m_mean,precipitation_sum&timezone=auto`);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const d=(await r.json()).daily;
+  climCache={times:d.time,temps:d.temperature_2m_mean,precips:d.precipitation_sum,lastYear};
+  return climCache;
+}
+/* ---- rain particle system ---- */
+function removeRain(){
+  if(rainSys){ scene.remove(rainSys.points); rainSys.points.geometry.dispose(); rainSys=null; }
+}
+function buildRain(intensity){
+  removeRain();
+  if(intensity<=0.02) return;
+  const N=Math.round(600+2400*intensity);
+  const W=geoCtx?geoCtx.sceneW:800, H=260;
+  const pos=new Float32Array(N*3), spd=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    pos[i*3]=(Math.random()-0.5)*W; pos[i*3+1]=Math.random()*H;
+    pos[i*3+2]=(Math.random()-0.5)*W;
+    spd[i]=55+Math.random()*40;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  const mat=new THREE.PointsMaterial({color:0xa8c8e8,size:1.5,transparent:true,
+    opacity:0.28+0.35*intensity,depthWrite:false});
+  const points=new THREE.Points(g,mat);
+  points.frustumCulled=false;
+  rainSys={points,spd,W,H,intensity};
+  scene.add(points);
+}
+function updateRain(dt){
+  if(!rainSys) return;
+  const pos=rainSys.points.geometry.attributes.position;
+  const wind=(weatherState?weatherState.windKmh:0)*0.12;
+  const wx=Math.cos(windDir)*wind, wz=Math.sin(windDir)*wind;
+  for(let i=0;i<rainSys.spd.length;i++){
+    let y=pos.getY(i)-rainSys.spd[i]*dt;
+    let x=pos.getX(i)+wx*dt, z=pos.getZ(i)+wz*dt;
+    if(y<0){ y=rainSys.H; x=(Math.random()-0.5)*rainSys.W; z=(Math.random()-0.5)*rainSys.W; }
+    pos.setXYZ(i,x,y,z);
+  }
+  pos.needsUpdate=true;
+}
+function applyWeather(w,label){
+  weatherState={...w,label};
+  windDir=((w.windDeg??windDir*180/Math.PI)+180)%360*Math.PI/180;
+  buildRain(rainIntensity(w.precip));
+  $('wxVal').textContent=`${Math.round(w.tempC)}°C · ${label}`;
+  $('wxInfo').textContent=
+    `${w.tempC.toFixed(1)}°C · ${w.precip.toFixed(1)}mm ${w.precipLabel||'now'} · `+
+    `wind ${Math.round(w.windKmh)}km/h · cloud ${Math.round(w.cloud)}%`+
+    (w.code!=null&&WMO_LABEL[w.code]?` · ${WMO_LABEL[w.code]}`:'');
+  applyAtmosphere();
+  log(`Weather: ${label} - ${w.tempC.toFixed(1)}C, ${w.precip.toFixed(1)}mm, wind ${Math.round(w.windKmh)}km/h`,'ok');
+}
+async function applyWeatherMode(){
+  if(!geoCtx) return;
+  const mode=$('wxMonth').value;
+  $('simWrap').style.display='none'; simData=null;
+  try{
+    if(mode==='live'){
+      const w=await fetchLiveWeather(geoCtx.cLat,geoCtx.cLon);
+      applyWeather(w,'live now');
+      return;
+    }
+    const month=+mode;
+    $('wxInfo').textContent='Loading 1980-present archive...';
+    const c=await fetchClimatology(geoCtx.cLat,geoCtx.cLon);
+    const rows=monthAggregate(c.times,c.temps,c.precips,month);
+    if(!rows.length) throw new Error('no archive rows for that month');
+    const tempMean=rows.reduce((s,r)=>s+r.tempMean,0)/rows.length;
+    const precipDaily=rows.reduce((s,r)=>s+r.precipSum,0)/rows.length/30;
+    const cloud=clamp(rows.reduce((s,r)=>s+r.wetFrac,0)/rows.length*130,15,90);
+    simData={rows,month,
+      tTrend:linearTrend(rows.map(r=>[r.year,r.tempMean])),
+      pTrend:linearTrend(rows.map(r=>[r.year,r.precipSum])),
+      tempMean};
+    const monthName=$('wxMonth').selectedOptions[0].textContent.split(' ')[0];
+    applyWeather({tempC:tempMean,precip:precipDaily,precipLabel:'/day',
+      windKmh:8,windDeg:null,cloud,code:null},
+      `${monthName} pattern (${rows[0].year}-${rows[rows.length-1].year})`);
+    $('simWrap').style.display='block';
+    $('simSlider').value=new Date().getFullYear();
+    updateSimYear();
+    if(simData.tTrend)
+      log(`Trend: ${(simData.tTrend.slope*10).toFixed(2)}C/decade in ${monthName} - drag Simulation year`,'ai');
+  }catch(err){
+    $('wxInfo').textContent='Weather unavailable: '+err.message;
+    log('Weather: '+err.message,'err');
+  }
+}
+function updateSimYear(){
+  if(!simData) return;
+  const y=+$('simSlider').value;
+  const row=simData.rows.find(r=>r.year===y);
+  const monthName=$('wxMonth').selectedOptions[0].textContent.split(' ')[0];
+  let tempC,precipSum,tag;
+  if(row){ tempC=row.tempMean; precipSum=row.precipSum; tag='observed'; }
+  else if(simData.tTrend){
+    tempC=simData.tTrend.predict(y);
+    precipSum=Math.max(0,simData.pTrend?simData.pTrend.predict(y):0);
+    tag=`predicted (${(simData.tTrend.slope*10>=0?'+':'')}${(simData.tTrend.slope*10).toFixed(2)}°C/decade)`;
+  }else return;
+  $('simVal').textContent=`${y} · ${tag.split(' ')[0]}`;
+  const cloud=clamp(precipSum/simData.rows.length*3,15,90);
+  applyWeather({tempC,precip:precipSum/30,precipLabel:'/day',windKmh:8,windDeg:null,
+    cloud,code:null},`${monthName} ${y} · ${tag}`);
+}
+$('wxMonth').addEventListener('change',applyWeatherMode);
+$('simSlider').addEventListener('input',updateSimYear);
+
+/* ============================================================
    AIR QUALITY & POLLUTION (OpenAQ + OSM-derived fallback)
    With a user key, live PM2.5 comes from OpenAQ stations near the
    capture zone. Without one (or on any failure) we estimate it from
@@ -1592,6 +1775,13 @@ function applyAtmosphere(){
   if(pol>0) scene.fog.color.lerp(new THREE.Color(0x8d7f66),Math.min(0.55,pol*(0.15+0.4*day)));
   if(exhaustMat) exhaustMat.opacity=pol*(0.10+0.12*day);
   if(smokeMat) smokeMat.opacity=pollutionCtx.stacks.length?Math.min(0.35,0.10+pol*0.18):0;
+
+  // weather: cloud cover flattens the light and greys the air
+  const cloud=weatherState?weatherState.cloud/100:0;
+  dirLight.intensity*=1-cloud*0.55;
+  hemiLight.intensity*=1-cloud*0.25;
+  sky.material.uniforms.turbidity.value=8+cloud*14;
+  scene.fog.density+=cloud*0.0009;
   bloomPass.strength=0.12+night*0.75+fogAmt*0.55;
   bloomPass.radius=0.25+fogAmt*0.5;
 }
@@ -2282,6 +2472,7 @@ $('buildBtn').addEventListener('click',async()=>{
       applyAtmosphere();
       log(`Night calibration: VIIRS Black Marble x${c.toFixed(2)}`,'ai');
     });
+    applyWeatherMode();
   }catch(err){
     console.error(err);
     log('Build failed: '+err.message,'err');
@@ -2301,6 +2492,9 @@ $('resetBtn').addEventListener('click',()=>{
   clearPollutionFX(); aqState=null;
   $('stAQ').innerHTML='&mdash;'; $('stAQ').style.color=''; $('stAQ').title='';
   removeLamps(); nightCalib=1;
+  removeRain(); weatherState=null; climCache=null; simData=null;
+  $('wxMonth').value='live'; $('wxVal').innerHTML='&mdash;'; $('wxInfo').textContent='';
+  $('simWrap').style.display='none';
   scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
@@ -2321,7 +2515,7 @@ function animate(){
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt);
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
