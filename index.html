@@ -138,6 +138,12 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 #bldCard .bc-row b.src-shadow{color:var(--accent)}
 #bldCard .bc-row b.src-typo{color:#a7b4c9}
 #bldCard .bc-hint{font-size:.56rem;color:#5d6b83;margin-top:8px;letter-spacing:.5px}
+
+/* zoom controls (3D view) */
+#zoomCtl{position:absolute;right:16px;bottom:64px;z-index:850;display:none;
+  flex-direction:column;gap:8px}
+#zoomCtl button{width:44px;height:44px;margin:0;padding:0;font-size:1.35rem;
+  border-radius:10px;line-height:1}
 </style>
 
 <script type="importmap">
@@ -351,7 +357,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <div id="layerList" style="font-size:.72rem"></div>
 
     <button id="resetBtn" class="ghost" style="margin-top:14px">&#8634; New Location</button>
-    <p class="hint"><b>Drag</b> to orbit &middot; <b>right-drag</b> to pan &middot; <b>scroll</b> to zoom.
+    <p class="hint"><b>Drag</b> to orbit &middot; <b>right-drag</b> to pan &middot; <b>scroll</b> or <b>+/&minus;</b> to zoom
+      &middot; <b>WASD/arrows</b> to move &middot; <b>R/F</b> up/down &middot; <b>double-click</b> to fly there.
       Slide time to dusk &mdash; windows and traffic light up.</p>
   </div>
 
@@ -367,6 +374,10 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <!-- ================= 3D ================= -->
 <div id="canvas-container"></div>
 <div id="routeCursor">SET POINT</div>
+<div id="zoomCtl">
+  <button id="zoomIn" class="ghost" title="Zoom in (+)">+</button>
+  <button id="zoomOut" class="ghost" title="Zoom out (-)">&minus;</button>
+</div>
 <div id="bldCard">
   <div class="bc-title">Building</div>
   <div class="bc-row"><span>Height</span><b id="bcH">-</b></div>
@@ -1936,6 +1947,60 @@ function hideBldCard(){
     selEdges.geometry.dispose(); selEdges.material.dispose(); selEdges=null; }
 }
 addEventListener('keydown',e=>{ if(e.key==='Escape') hideBldCard(); });
+
+/* ---- free navigation: zoom buttons, WASD flight, double-click fly-to ---- */
+function dollyZoom(f){
+  if(!renderer||appState!=='city') return;
+  const off=camera.position.clone().sub(controls.target).multiplyScalar(f);
+  off.setLength(clamp(off.length(),controls.minDistance,controls.maxDistance));
+  camera.position.copy(controls.target).add(off);
+}
+$('zoomIn').addEventListener('click',()=>dollyZoom(0.72));
+$('zoomOut').addEventListener('click',()=>dollyZoom(1/0.72));
+const navKeys=new Set();
+const NAV_SET=new Set(['w','a','s','d','r','f','arrowup','arrowdown','arrowleft','arrowright']);
+addEventListener('keydown',e=>{
+  const el=document.activeElement;
+  if(el&&['INPUT','SELECT','TEXTAREA'].includes(el.tagName)) return;
+  const k=e.key.toLowerCase();
+  if(k==='+'||k==='=') dollyZoom(0.8);
+  else if(k==='-') dollyZoom(1.25);
+  else if(NAV_SET.has(k)){ navKeys.add(k); e.preventDefault(); }
+});
+addEventListener('keyup',e=>navKeys.delete(e.key.toLowerCase()));
+addEventListener('blur',()=>navKeys.clear());
+const _nf=new THREE.Vector3(), _nr=new THREE.Vector3(), _nm=new THREE.Vector3();
+function updateNav(dt){
+  if(appState!=='city'||!navKeys.size||camAnim) return;
+  camera.getWorldDirection(_nf); _nf.y=0;
+  if(_nf.lengthSq()<1e-6) return;
+  _nf.normalize();
+  _nr.set(-_nf.z,0,_nf.x);                    // right-hand of camera heading
+  _nm.set(0,0,0);
+  if(navKeys.has('w')||navKeys.has('arrowup')) _nm.add(_nf);
+  if(navKeys.has('s')||navKeys.has('arrowdown')) _nm.sub(_nf);
+  if(navKeys.has('d')||navKeys.has('arrowright')) _nm.add(_nr);
+  if(navKeys.has('a')||navKeys.has('arrowleft')) _nm.sub(_nr);
+  if(navKeys.has('r')) _nm.y+=0.85;
+  if(navKeys.has('f')) _nm.y-=0.85;
+  if(!_nm.lengthSq()) return;
+  // fly faster when zoomed out, slower at street level
+  _nm.setLength(Math.max(25,camera.position.distanceTo(controls.target)*0.7)*dt);
+  camera.position.add(_nm);
+  controls.target.add(_nm.setY(0));
+  camera.position.y=Math.max(2,camera.position.y);
+}
+addEventListener('dblclick',e=>{
+  if(!renderer||appState!=='city'||e.target!==renderer.domElement||routeMode) return;
+  mouseNDC.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);
+  raycaster.setFromCamera(mouseNDC,camera);
+  const hit=raycaster.intersectObject(groundMesh);
+  if(!hit.length) return;
+  const p=hit[0].point;
+  const off=camera.position.clone().sub(controls.target).multiplyScalar(0.55);
+  if(off.length()<controls.minDistance*1.5) off.setLength(controls.minDistance*1.5);
+  flyTo(p.clone().add(off),p.clone(),1.4);
+});
 function addRouteMarker(p,color){
   const g=new THREE.Group();
   const cone=new THREE.Mesh(new THREE.ConeGeometry(3.2,9,12),
@@ -2537,6 +2602,7 @@ $('buildBtn').addEventListener('click',async()=>{
     $('map-overlay').classList.add('hidden');
     $('panel-map').style.display='none';
     $('panel-city').style.display='block';
+    $('zoomCtl').style.display='flex';
     appState='city';
 
     // cinematic entrance: sweep down from high altitude
@@ -2569,6 +2635,7 @@ $('buildBtn').addEventListener('click',async()=>{
 
 $('resetBtn').addEventListener('click',()=>{
   appState='map';
+  $('zoomCtl').style.display='none';
   setRouteMode(false); hideBldCard(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
   clearGroup(synGroup); synGroup.visible=true;
@@ -2601,7 +2668,7 @@ function animate(){
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt); updateNav(dt);
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
