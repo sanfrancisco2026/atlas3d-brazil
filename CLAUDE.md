@@ -149,7 +149,12 @@ No required API keys. All backing services are free/public:
     postcard + GLB export. Open candidates: new preset Goiás municipalities;
     offline-first fallback UX; colour-coded AQ health bands.
 - This is a static app: keep it dependency-free and buildless unless a change
-  genuinely requires tooling — prefer plain JS/CSS/HTML additions.
+  genuinely requires tooling — prefer plain JS/CSS/HTML additions. Runtime CDN
+  assets in use: three.js + Leaflet (unpkg) and Font Awesome 6 Free (cdnjs) —
+  FA glyphs drive the planner-layer 3D icon sprites (`FA_GLYPH`/`iconTexture`,
+  hand-drawn canvas shapes as fallback if the webfont fails), the layer-list
+  icons, and the traffic-fleet legend. `iconTexture` waits on `faReady`
+  (`document.fonts.load`) via `buildPlannerLayers`.
 - The two `atlas_local_*.js` files are large (28MB / 5.6MB) generated data
   extracts, not hand-edited source — treat them as read-only data unless a task
   is specifically about reshaping the dataset format.

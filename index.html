@@ -6,6 +6,7 @@
 <title>ATLAS-3D &mdash; Any Place on Earth, in Immersive 3D</title>
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"/>
 
 <style>
 :root{
@@ -343,6 +344,9 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="shotBtn" class="ghost">&#128247; Postcard</button>
       <button id="glbBtn" class="ghost">&#11015; 3D model (.glb)</button>
     </div>
+
+    <div class="slider-row" style="margin-top:12px"><span>Traffic fleet</span><b id="fleetTotal">0</b></div>
+    <div id="fleetLegend" style="display:flex;gap:12px;flex-wrap:wrap;font-size:.72rem;color:#93a3bc"></div>
 
     <div id="stats" style="display:grid">
       <div class="stat"><span class="v" id="stBuildings">0</span><span class="k">Real buildings</span></div>
@@ -1409,9 +1413,19 @@ function buildTraffic(){
         t.key==='bus'?0xd97a1a : t.key==='truck'?0xe6e6e6 : pickPaint()));
     }
     if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
+    mesh.userData.fleetCount=n;
     trafficMeshes.push(mesh); scene.add(mesh);
   });
   trafficMesh=trafficMeshes[0]||null;   // legacy handle used by reset guard
+  // Font Awesome fleet legend in the panel
+  const FLEET_FA={car:'fa-car',moto:'fa-motorcycle',van:'fa-van-shuttle',
+    bus:'fa-bus',truck:'fa-truck'};
+  const counts={};
+  cars.forEach(c=>counts[VEH_TYPES[c.ti].key]=(counts[VEH_TYPES[c.ti].key]||0)+1);
+  $('fleetLegend').innerHTML=VEH_TYPES.filter(t=>counts[t.key]).map(t=>
+    `<span title="${t.key}"><i class="fa-solid ${FLEET_FA[t.key]}"`+
+    ` style="color:#9fc2e8;margin-right:4px"></i>${counts[t.key]}</span>`).join('');
+  $('fleetTotal').textContent=cars.length;
 }
 const _cm=new THREE.Matrix4(), _cq=new THREE.Quaternion(), _cs=new THREE.Vector3(1,1,1),
       _ce=new THREE.Euler(), _cp=new THREE.Vector3();
@@ -2213,18 +2227,18 @@ $('viewOrbit').addEventListener('click',e=>{
 /* ============================================================
    PLANNER LAYERS - toggleable transparent overlays from OSM
 ============================================================ */
-const LAYER_DEFS=[
- ['labels', '#ffffff','Building / POI labels'],
- ['signals','#ff4d5e','Traffic signals'],
- ['bumps',  '#ff9a3d','Speed bumps / calming'],
- ['lamps',  '#ffdb0d','Street lamps'],
- ['lit',    '#ffe64d','Lit streets (lit=*)'],
- ['drainage','#38e1ff','Drainage & waterways'],
- ['flood',  '#2f6bff','Low-lying / flood-prone'],
- ['power',  '#ff5566','Power grid (voltage-colored)'],
- ['pipelines','#c98a3d','Oil & gas pipelines'],
- ['telecom','#c77dff','Telecom & data infra'],
- ['waterinf','#2fd4c0','Water & sanitation'],
+const LAYER_DEFS=[   // [key, colour, label, font-awesome class]
+ ['labels', '#ffffff','Building / POI labels','fa-tag'],
+ ['signals','#ff4d5e','Traffic signals','fa-traffic-light'],
+ ['bumps',  '#ff9a3d','Speed bumps / calming','fa-triangle-exclamation'],
+ ['lamps',  '#ffdb0d','Street lamps','fa-lightbulb'],
+ ['lit',    '#ffe64d','Lit streets (lit=*)','fa-road'],
+ ['drainage','#38e1ff','Drainage & waterways','fa-water'],
+ ['flood',  '#2f6bff','Low-lying / flood-prone','fa-house-flood-water'],
+ ['power',  '#ff5566','Power grid (voltage-colored)','fa-bolt'],
+ ['pipelines','#c98a3d','Oil & gas pipelines','fa-gas-pump'],
+ ['telecom','#c77dff','Telecom & data infra','fa-tower-broadcast'],
+ ['waterinf','#2fd4c0','Water & sanitation','fa-droplet'],
 ];
 let plannerGroups={}, lampGlowMat=null, windRotors=[];
 /* OpenInfraMap-style voltage color ramp (data (c) OSM) */
@@ -2250,11 +2264,11 @@ function makeWindTurbine(x,z){
 }
 function plannerInitUI(){
   const list=$('layerList'); list.innerHTML='';
-  LAYER_DEFS.forEach(([k,color,label])=>{
+  LAYER_DEFS.forEach(([k,color,label,fa])=>{
     const row=document.createElement('label');
     row.style.cssText='display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;color:#93a3bc';
     row.innerHTML=`<input type="checkbox" data-layer="${k}" disabled>
-      <span style="width:9px;height:9px;border-radius:2px;background:${color};flex:none"></span>
+      <i class="fa-solid ${fa||'fa-layer-group'}" style="color:${color};width:14px;text-align:center;font-size:.72rem;flex:none"></i>
       <span id="ly-${k}">${label}</span>`;
     list.appendChild(row);
   });
@@ -2288,7 +2302,14 @@ function layerEnable(k,n){
   const def=LAYER_DEFS.find(d=>d[0]===k);
   if(cb&&n>0){ cb.disabled=false; $('ly-'+k).textContent=`${def[2]} (${n})`; }
 }
-/* --- mini icon sprites --- */
+/* --- mini icon sprites (Font Awesome glyphs, hand-drawn fallback) --- */
+const FA_FONT='900 44px "Font Awesome 6 Free"';
+const FA_GLYPH={signal:'',bump:'',lamp:'',bolt:'',
+  wave:'',drop:'',sub:'',sun:'',dc:'',pump:''};
+// kick off the webfont fetch early; resolves (or silently fails) once
+const faReady=(document.fonts&&document.fonts.load)
+  ? document.fonts.load(FA_FONT,'').catch(()=>{})
+  : Promise.resolve();
 const iconCache={};
 function iconTexture(kind,color){
   const key=kind+color;
@@ -2298,7 +2319,10 @@ function iconTexture(kind,color){
   x.beginPath(); x.arc(48,48,42,0,7); x.fillStyle='rgba(8,12,20,.92)'; x.fill();
   x.lineWidth=5; x.strokeStyle=color; x.stroke();
   x.fillStyle=color; x.strokeStyle=color;
-  if(kind==='signal'){ x.fillStyle='#222'; x.fillRect(38,20,20,56);
+  if(FA_GLYPH[kind]&&document.fonts&&document.fonts.check(FA_FONT)){
+    x.font=FA_FONT; x.textAlign='center'; x.textBaseline='middle';
+    x.fillText(FA_GLYPH[kind],48,50);
+  }else if(kind==='signal'){ x.fillStyle='#222'; x.fillRect(38,20,20,56);
     ['#ff4444','#ffdd44','#44ff77'].forEach((cl,i)=>{x.beginPath();
       x.arc(48,30+i*18,7,0,7); x.fillStyle=cl; x.fill();});
   }else if(kind==='bump'){ x.lineWidth=7; x.beginPath();
@@ -2365,6 +2389,7 @@ async function overpassAny(q){
 }
 async function buildPlannerLayers(b){
   $('lyCount').textContent='loading...';
+  await faReady;   // icons draw Font Awesome glyphs once the webfont is in
   const toX=(lon)=>(lon-geoCtx.cLon)*geoCtx.mPerLon, toZ=(lat)=>(geoCtx.cLat-lat)*M_LAT;
   try{
     const q=`[out:json][timeout:30];(
@@ -2752,6 +2777,7 @@ $('resetBtn').addEventListener('click',()=>{
   $('synBtn').textContent='Synthetic infill: ON';
   plannerClear();
   removeTraffic();
+  $('fleetLegend').innerHTML=''; $('fleetTotal').textContent='0';
   clearPollutionFX(); aqState=null;
   $('stAQ').innerHTML='&mdash;'; $('stAQ').style.color=''; $('stAQ').title='';
   removeLamps(); nightCalib=1;
