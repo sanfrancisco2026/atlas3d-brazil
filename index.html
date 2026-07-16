@@ -2241,6 +2241,7 @@ const LAYER_DEFS=[   // [key, colour, label, font-awesome class]
  ['waterinf','#2fd4c0','Water & sanitation','fa-droplet'],
 ];
 let plannerGroups={}, lampGlowMat=null, windRotors=[];
+let plannerCnt=null, terrainGrid=null;
 /* OpenInfraMap-style voltage color ramp (data (c) OSM) */
 function parseVolt(v){ const a=String(v||'').split(/[;,]/).map(parseFloat).filter(n=>!isNaN(n));
   return a.length?Math.max(...a)/1000:0; }
@@ -2278,7 +2279,13 @@ function plannerInitUI(){
     ['132-220','#b55d00'],['220-330','#c73030'],['330+','#b54eb2']]
     .map(([l,c])=>`<span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px">`+
       `<span style="width:14px;height:3px;background:${c};display:inline-block"></span>${l}</span>`).join('');
-  list.appendChild(leg);
+  const note=document.createElement('div'); note.id='simNote';
+  note.style.cssText='display:none;margin-top:6px;font-size:.6rem;color:#c9a86a;line-height:1.5';
+  note.innerHTML='<i class="fa-solid fa-wand-magic-sparkles"></i> '+
+    'Layers marked <b>simulated</b> have no OSM data in this zone: they are '+
+    'plausible estimates generated from the road grid, buildings and terrain. '+
+    'Indicative only &mdash; not for engineering decisions.';
+  list.appendChild(note);
   list.addEventListener('change',e=>{
     const k=e.target.dataset.layer;
     if(plannerGroups[k]) plannerGroups[k].visible=e.target.checked;
@@ -2288,8 +2295,10 @@ function plannerInitUI(){
 function plannerClear(){
   Object.values(plannerGroups).forEach(g=>scene.remove(g));
   plannerGroups={}; lampGlowMat=null; windRotors=[];
+  plannerCnt=null; terrainGrid=null;
   document.querySelectorAll('#layerList input').forEach(c=>{c.checked=false;c.disabled=true;});
   LAYER_DEFS.forEach(([k,,label])=>{const el=$('ly-'+k); if(el) el.textContent=label;});
+  const sn=$('simNote'); if(sn) sn.style.display='none';
   $('lyCount').textContent='...';
 }
 function PG(k){
@@ -2297,10 +2306,11 @@ function PG(k){
     plannerGroups[k].visible=false; scene.add(plannerGroups[k]); }
   return plannerGroups[k];
 }
-function layerEnable(k,n){
+function layerEnable(k,n,sim){
   const cb=document.querySelector(`#layerList input[data-layer="${k}"]`);
   const def=LAYER_DEFS.find(d=>d[0]===k);
-  if(cb&&n>0){ cb.disabled=false; $('ly-'+k).textContent=`${def[2]} (${n})`; }
+  if(cb&&n>0){ cb.disabled=false;
+    $('ly-'+k).textContent=`${def[2]} (${n}${sim?' · simulated':''})`; }
 }
 /* --- mini icon sprites (Font Awesome glyphs, hand-drawn fallback) --- */
 const FA_FONT='900 44px "Font Awesome 6 Free"';
@@ -2522,13 +2532,17 @@ async function buildPlannerLayers(b){
       }
     });
     Object.entries(cnt).forEach(([k,n])=>layerEnable(k,n));
+    plannerCnt=cnt;
     $('lyCount').textContent='ready';
     log(`Planner layers: ${Object.entries(cnt).filter(([,n])=>n).map(([k,n])=>k+':'+n).join(' ')}`,'ok');
   }catch(err){
     $('lyCount').textContent='partial';
     log('Planner layers unavailable (Overpass): '+err.message,'err');
   }
-  buildFloodLayer(b).catch(e=>{ log('Flood layer: elevation service unavailable ('+e.message+')','err'); });
+  // terrain first (simulations use it for siting), then fill the gaps
+  buildFloodLayer(b)
+    .catch(e=>{ log('Flood layer: elevation service unavailable ('+e.message+')','err'); })
+    .finally(()=>{ try{ simulatePlannerGaps(); }catch(e){ log('Layer simulation failed: '+e.message,'err'); } });
 }
 /* --- flood / low-lying layer from open elevation APIs --- */
 async function buildFloodLayer(b){
@@ -2553,6 +2567,7 @@ async function buildFloodLayer(b){
   }
   if(!elev||elev.length<N*N||elev.some(e=>e==null)) throw new Error('incomplete elevation data');
   const mn=Math.min(...elev), mx=Math.max(...elev), range=Math.max(mx-mn,0.01);
+  terrainGrid={elev,N,S:b.S,W:b.W,latSpan:b.N-b.S,lonSpan:b.E-b.W,mn,mx};
   const c=document.createElement('canvas'); c.width=c.height=256;
   const x=c.getContext('2d'); const cell=256/N;
   x.filter='blur(7px)';
@@ -2569,6 +2584,136 @@ async function buildFloodLayer(b){
   layerEnable('flood',1); $('ly-flood').textContent=
     `Low-lying / flood-prone (${Math.round(mn)}-${Math.round(mx)}m terrain)`;
   log(`Flood layer ready: terrain ${Math.round(mn)}m to ${Math.round(mx)}m`,'ok');
+}
+
+/* ============================================================
+   SIMULATED INFRASTRUCTURE LAYERS
+   Runs once per build, after the real Overpass planner layers and the
+   terrain fetch. Any layer with no OSM data in the zone is filled with
+   a plausible estimate derived from what the scene itself knows - the
+   road grid, building stock and terrain - following how such systems
+   are actually engineered (drains under the lowest streets, feeders
+   along major roads, cell sites on the tallest roofs, tanks on high
+   ground). Everything is badged "simulated" in the layer list, logged,
+   and disclaimed in the panel note.
+============================================================ */
+function terrainAt(x,z){
+  if(!terrainGrid) return null;
+  const ll=sceneToLatLon(x,z), g=terrainGrid;
+  const gx=clamp(Math.floor((ll.lon-g.W)/g.lonSpan*g.N),0,g.N-1);
+  const gy=clamp(Math.floor((ll.lat-g.S)/g.latSpan*g.N),0,g.N-1);
+  return g.elev[gy*g.N+gx];
+}
+function simulatePlannerGaps(){
+  if(appState!=='city'||!trafficPaths.length) return;
+  const cnt=plannerCnt||{};
+  const rand=mulberry32(((Math.abs(geoCtx.cLat*1e4)|0)^(Math.abs(geoCtx.cLon*1e4)|0))>>>0);
+  const majors=trafficPaths.filter(p=>p.major).sort((a,b)=>b.total-a.total);
+  const minors=trafficPaths.filter(p=>!p.major);
+  const simulated=[];
+
+  // speed bumps: residential streets get calming every ~150m on a sample
+  if(!(cnt.bumps>0)&&minors.length){
+    let n=0;
+    minors.filter(()=>rand()<0.3).forEach(p=>{
+      for(let d=90;d<p.total-40&&n<36;d+=140+rand()*70){
+        const pt=pointOnPath(p,d);
+        addIcon(PG('bumps'),'bump','#ff9a3d',pt.x,pt.z,4,5); n++;
+      }
+    });
+    if(n){ layerEnable('bumps',n,true); simulated.push('speed bumps'); }
+  }
+
+  // street-lamp markers: municipal spacing along the road grid
+  if(!(cnt.lamps>0)){
+    const spots=lampPositions(trafficPaths,400).filter((_,i)=>i%7===0).slice(0,48);
+    spots.forEach(s=>addIcon(PG('lamps'),'lamp','#ffdb0d',s.x,s.z,6,4.5));
+    if(spots.length){ layerEnable('lamps',spots.length,true); simulated.push('street lamps'); }
+  }
+
+  // lit streets: assume the arterial network is lit
+  if(!(cnt.lit>1)&&majors.length){
+    majors.forEach(p=>PG('lit').add(new THREE.Mesh(ribbonGeometry(p.pts,6.5,0.3),
+      new THREE.MeshBasicMaterial({color:0xffe64d,transparent:true,opacity:.16,
+        depthWrite:false,side:THREE.DoubleSide}))));
+    layerEnable('lit',majors.length,true); simulated.push('lit streets');
+  }
+
+  // drainage: storm drains presumed under the lowest-lying streets
+  if(!(cnt.drainage>2)){
+    let pool=trafficPaths.slice();
+    if(terrainGrid)
+      pool.sort((a,b)=>(terrainAt(a.pts[0].x,a.pts[0].z)??1e9)-(terrainAt(b.pts[0].x,b.pts[0].z)??1e9));
+    else pool.sort((a,b)=>b.total-a.total);
+    const picked=pool.slice(0,10);
+    picked.forEach(p=>PG('drainage').add(new THREE.Mesh(ribbonGeometry(p.pts,1.6,0.32),
+      new THREE.MeshBasicMaterial({color:0x38e1ff,transparent:true,opacity:.5,
+        depthWrite:false,side:THREE.DoubleSide}))));
+    if(picked.length){ layerEnable('drainage',picked.length,true); simulated.push('storm drainage'); }
+  }
+
+  // power: low-voltage distribution feeders strung along major roads
+  if(!(cnt.power>0)&&majors.length){
+    let n=0;
+    majors.slice(0,4).forEach(p=>{
+      const pts3=p.pts.map(q=>new THREE.Vector3(q.x,7.5,q.z));
+      PG('power').add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts3),
+        new THREE.LineBasicMaterial({color:0x7a7a85,transparent:true,opacity:.85})));
+      for(let d=40;d<p.total;d+=75){
+        const pt=pointOnPath(p,d), lo=laneOffset(pt.yaw,1,8);
+        addIcon(PG('power'),'bolt','#9a9aa5',pt.x+lo.ox,pt.z+lo.oz,7,3);
+      }
+      n++;
+    });
+    layerEnable('power',n,true); simulated.push('power feeders (<10kV)');
+  }
+
+  // pipelines: one presumed gas-distribution main under the longest artery
+  if(!(cnt.pipelines>0)&&majors.length&&majors[0].total>400){
+    PG('pipelines').add(new THREE.Mesh(ribbonGeometry(majors[0].pts,1.2,0.28),
+      new THREE.MeshBasicMaterial({color:0xc98a3d,transparent:true,opacity:.45,
+        depthWrite:false,side:THREE.DoubleSide})));
+    layerEnable('pipelines',1,true); simulated.push('gas main');
+  }
+
+  // telecom: presumed cell sites co-located on the tallest rooftops
+  if(!(cnt.telecom>0)){
+    const tall=cityGroup.children.filter(m=>m.userData&&m.userData.h)
+      .sort((a,b)=>b.userData.h-a.userData.h).slice(0,3);
+    tall.forEach(m=>{
+      const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
+      const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
+      addIcon(PG('telecom'),'wave','#c77dff',x,z,m.userData.h+10,7);
+    });
+    if(tall.length){ layerEnable('telecom',tall.length,true); simulated.push('cell sites'); }
+  }
+
+  // water & sanitation: hydrants along arteries + a tank on high ground
+  if(!(cnt.waterinf>0)){
+    let n=0;
+    majors.slice(0,5).forEach(p=>{
+      for(let d=110;d<p.total&&n<24;d+=220){
+        const pt=pointOnPath(p,d), lo=laneOffset(pt.yaw,1,9);
+        addIcon(PG('waterinf'),'drop','#2fd4c0',pt.x+lo.ox,pt.z+lo.oz,4,4); n++;
+      }
+    });
+    if(terrainGrid){
+      let bi=0;
+      terrainGrid.elev.forEach((e,i)=>{ if(e>terrainGrid.elev[bi]) bi=i; });
+      const g=terrainGrid, gy=Math.floor(bi/g.N), gx=bi%g.N;
+      const lat=g.S+(gy+0.5)/g.N*g.latSpan, lon=g.W+(gx+0.5)/g.N*g.lonSpan;
+      addIcon(PG('waterinf'),'pump','#2fd4c0',
+        (lon-geoCtx.cLon)*geoCtx.mPerLon,(geoCtx.cLat-lat)*M_LAT,10,8);
+      n++;
+    }
+    if(n){ layerEnable('waterinf',n,true); simulated.push('water network'); }
+  }
+
+  if(simulated.length){
+    const sn=$('simNote'); if(sn) sn.style.display='block';
+    log('SIMULATED layers (no OSM data mapped here): '+simulated.join(', '),'ai');
+    log('Simulated = estimated from roads/buildings/terrain - indicative only','ai');
+  }
 }
 /* ============================================================
    MAPILLARY STREET-PHOTO FACADES (optional token)

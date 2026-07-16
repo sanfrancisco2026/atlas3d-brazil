@@ -100,6 +100,15 @@ two offline data files. There is no server, no package.json, no bundler — open
    into a monthly pattern, and the simulation-year slider replays observed
    years or extrapolates by `linearTrend` (pure) past the archive. Tested in
    `test/weather_trend.test.js`.
+13b. Simulated infrastructure (`simulatePlannerGaps`): after the real planner
+   layers + terrain fetch resolve, any layer with no OSM data in the zone is
+   filled with an estimate derived from the scene (bumps on residential
+   streets, lamps at municipal spacing, arterials presumed lit, storm drains
+   under the lowest streets via `terrainAt`, LV feeders + poles along majors,
+   one gas main under the longest artery, cell sites on the 3 tallest roofs,
+   hydrants + a tank on the highest terrain cell). Badged "· simulated" via
+   `layerEnable(k,n,true)`, disclaimed in `#simNote`, logged. Deterministic
+   per location (mulberry32 seeded from cLat/cLon).
 14. 2D-map overlays: time machine (`gibsUrl`, pure) overlays dated NASA MODIS
    true-color imagery (2000→, date picker + opacity, maxNativeZoom 9); live
    radar toggle animates the last 8 RainViewer frames (`nextFrame`, pure).
