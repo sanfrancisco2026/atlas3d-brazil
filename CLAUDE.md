@@ -67,9 +67,16 @@ two offline data files. There is no server, no package.json, no bundler — open
    lighting; a CORS-tainted canvas degrades to applying the photo untinted.
    Tested by `test/facade_match.test.js` (14 geometry checks; exit 0 = pass).
 8. Routing uses public OSRM; geocoding uses public Nominatim.
-10. Traffic is a mixed fleet (cars/motos/buses, per-instance paint, buses on
-   major roads only) with right-hand lane discipline via `laneOffset` (pure,
-   tested in `test/traffic_lane.test.js`).
+10. Traffic is a five-class fleet (cars/motos/vans/buses/trucks — multi-box
+   bodies + cylinder wheels in a second dark material group, per-instance
+   paint, heavy vehicles on major roads only) with right-hand lane discipline
+   via `laneOffset` (pure, tested in `test/traffic_lane.test.js`).
+10b. Named roads get flat street-name labels on the road surface
+   (`buildRoadLabels`; `dedupeRoadNames`/`labelYaw` pure, tested in
+   `test/road_labels.test.js`). Offline builds fetch names via a light async
+   Overpass query since the Geofabrik extracts lack the name field.
+10c. 3D navigation: +/- zoom buttons and keys (`dollyZoom`), WASD/arrow
+   flight with R/F altitude (`updateNav`), double-click fly-to on the ground.
 11. Air quality: `applyAirQuality` uses OpenAQ v3 (optional user key input
    `#aqKey`) or falls back to `estimatePM25` (pure, tested) derived from road
    density + industrial footprint collected during build. PM2.5 drives smog

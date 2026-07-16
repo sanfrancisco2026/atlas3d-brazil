@@ -6,9 +6,11 @@ function laneOffset(yaw,dir,laneW){
   return {ox:-Math.cos(face)*laneW, oz:Math.sin(face)*laneW};
 }
 const VEH_TYPES=[
-  {key:'car',  share:0.72, vMin:7,  vMax:14,  lane:1.9, majorOnly:false},
-  {key:'moto', share:0.16, vMin:9,  vMax:17,  lane:1.1, majorOnly:false},
-  {key:'bus',  share:0.12, vMin:5.5,vMax:8.5, lane:2.3, majorOnly:true},
+  {key:'car',  share:0.56, vMin:7,  vMax:14, lane:1.9, majorOnly:false},
+  {key:'moto', share:0.14, vMin:9,  vMax:17, lane:1.1, majorOnly:false},
+  {key:'van',  share:0.12, vMin:6.5,vMax:12, lane:2.0, majorOnly:false},
+  {key:'bus',  share:0.09, vMin:5.5,vMax:8.5, lane:2.3, majorOnly:true},
+  {key:'truck',share:0.09, vMin:5,  vMax:9,  lane:2.3, majorOnly:true},
 ];
 
 let pass=0, fail=0;
@@ -41,8 +43,13 @@ console.log('=== fleet composition sanity ===');
 check('type shares sum to 1', near(VEH_TYPES.reduce((s,t)=>s+t.share,0),1));
 check('every type has vMin<vMax and positive lane',
   VEH_TYPES.every(t=>t.vMin<t.vMax&&t.lane>0));
-check('buses are slowest and widest-offset',
-  VEH_TYPES[2].vMax<VEH_TYPES[0].vMax&&VEH_TYPES[2].lane>VEH_TYPES[0].lane);
+const car=VEH_TYPES.find(t=>t.key==='car');
+const heavies=VEH_TYPES.filter(t=>['bus','truck'].includes(t.key));
+check('heavy vehicles stick to major roads', heavies.every(t=>t.majorOnly));
+check('heavy vehicles are slower and wider-offset than cars',
+  heavies.every(t=>t.vMax<car.vMax&&t.lane>car.lane));
+check('all five classes present',
+  ['car','moto','van','bus','truck'].every(k=>VEH_TYPES.some(t=>t.key===k)));
 
 console.log(fail===0?'ALL PASS ('+pass+' checks)':'FAIL ('+fail+')');
 process.exit(fail===0?0:1);

@@ -426,7 +426,7 @@ let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
 let trafficPaths = [], cars = [], trafficMeshes = [];
 let camAnim = null, timeAnim = null;
-let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [];
+let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
@@ -905,6 +905,7 @@ function buildSharedMaterials(){
   // white base colour so per-instance paint colours (setColorAt) show true
   vehMats=VEH_TYPES.map(()=>new THREE.MeshStandardMaterial({color:0xffffff,
     metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35}));
+  wheelMat=new THREE.MeshStandardMaterial({color:0x17181c,roughness:.92,metalness:.1});
   matCar=vehMats[0];
 }
 
@@ -1333,13 +1334,26 @@ function buildTrees(osm){
    right-hand lane discipline (vehicles drive offset to the right of the way
    centreline, so opposing directions pass instead of overlapping), and
    per-class speeds. Buses only run on major roads. */
+// Five classes with real silhouettes: multi-box bodies + cylinder wheels.
+// boxes: [w,h,l, centerY, centerZ] (x always 0); wheels: radius, width,
+// axle half-track (0 = single centreline wheel, motorcycles), axle z list.
+// Body undersides sit at wheel-radius height so wheels touch the road.
 const VEH_TYPES=[
-  {key:'car',  dims:[1.75,1.05,4.1], cabin:[1.58,0.72,2.0,-0.25], share:0.72,
-   vMin:7,  vMax:14,  lane:1.9, majorOnly:false},
-  {key:'moto', dims:[0.65,0.95,2.0], cabin:null,                  share:0.16,
-   vMin:9,  vMax:17,  lane:1.1, majorOnly:false},
-  {key:'bus',  dims:[2.5,2.9,11.4],  cabin:null,                  share:0.12,
-   vMin:5.5,vMax:8.5, lane:2.3, majorOnly:true},
+  {key:'car',  share:0.56, vMin:7,  vMax:14, lane:1.9, majorOnly:false,
+   boxes:[[1.72,0.60,4.15,0.65,0],[1.55,0.50,2.05,1.20,-0.18]],      // slab + cabin
+   wheels:{r:0.33,w:0.26,ax:0.72,zs:[1.35,-1.35]}},
+  {key:'moto', share:0.14, vMin:9,  vMax:17, lane:1.1, majorOnly:false,
+   boxes:[[0.50,0.45,1.80,0.62,0],[0.42,0.62,0.65,1.16,-0.20]],      // frame + rider
+   wheels:{r:0.30,w:0.13,ax:0,zs:[0.70,-0.70]}},
+  {key:'van',  share:0.12, vMin:6.5,vMax:12, lane:2.0, majorOnly:false,
+   boxes:[[1.88,1.28,3.55,1.00,-0.55],[1.80,0.62,1.00,0.67,1.85]],   // cargo + hood
+   wheels:{r:0.36,w:0.26,ax:0.78,zs:[1.50,-1.35]}},
+  {key:'bus',  share:0.09, vMin:5.5,vMax:8.5, lane:2.3, majorOnly:true,
+   boxes:[[2.48,2.42,11.3,1.67,0]],                                  // coach body
+   wheels:{r:0.46,w:0.34,ax:0.98,zs:[3.65,-3.65]}},
+  {key:'truck',share:0.09, vMin:5,  vMax:9,  lane:2.3, majorOnly:true,
+   boxes:[[2.25,1.50,2.15,1.20,3.35],[2.42,2.20,6.40,1.55,-0.85]],   // cab + cargo box
+   wheels:{r:0.45,w:0.34,ax:0.95,zs:[3.20,-0.70,-2.70]}},            // 6 wheels
 ];
 // Brazilian fleet skews heavily white/silver
 const VEH_PAINT=[[0xf2f2f2,.32],[0xc9ccd2,.24],[0x7a7f87,.12],[0x14161a,.12],
@@ -1356,12 +1370,19 @@ function laneOffset(yaw,dir,laneW){
   return {ox:-Math.cos(face)*laneW, oz:Math.sin(face)*laneW};
 }
 function vehicleGeometry(t){
-  const [w,h,l]=t.dims;
-  const body=new THREE.BoxGeometry(w,h,l); body.translate(0,h/2,0);
-  if(!t.cabin) return body;
-  const [cw,ch,cl,cz]=t.cabin;
-  const cab=new THREE.BoxGeometry(cw,ch,cl); cab.translate(0,h+ch/2-0.14,cz);
-  return mergeGeometries([body,cab]);
+  const body=mergeGeometries(t.boxes.map(([w,h,l,y,z])=>{
+    const g=new THREE.BoxGeometry(w,h,l); g.translate(0,y,z); return g;
+  }));
+  const {r,w:ww,ax,zs}=t.wheels;
+  const wg=[];
+  zs.forEach(z=>(ax?[-ax,ax]:[0]).forEach(x=>{
+    const c=new THREE.CylinderGeometry(r,r,ww,10);
+    c.rotateZ(Math.PI/2);           // axle across the vehicle
+    c.translate(x,r,z);             // resting on the road
+    wg.push(c);
+  }));
+  // two material groups: 0 = painted body, 1 = dark rubber wheels
+  return mergeGeometries([body,mergeGeometries(wg)],true);
 }
 function removeTraffic(){
   trafficMeshes.forEach(m=>{ scene.remove(m); m.geometry.dispose(); });
@@ -1377,14 +1398,15 @@ function buildTraffic(){
     const pool=t.majorOnly?majors:trafficPaths;
     if(!pool.length) return;
     const n=Math.max(1,Math.round(N*t.share));
-    const mesh=new THREE.InstancedMesh(vehicleGeometry(t),vehMats[ti],n);
+    const mesh=new THREE.InstancedMesh(vehicleGeometry(t),[vehMats[ti],wheelMat],n);
     mesh.castShadow=true;
     for(let i=0;i<n;i++){
       const p=pool[Math.floor(Math.random()*pool.length)];
       cars.push({path:p, d:Math.random()*p.total,
         v:t.vMin+Math.random()*(t.vMax-t.vMin),
         dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, pool});
-      mesh.setColorAt(i,col.setHex(t.key==='bus'?0xd97a1a:pickPaint()));
+      mesh.setColorAt(i,col.setHex(
+        t.key==='bus'?0xd97a1a : t.key==='truck'?0xe6e6e6 : pickPaint()));
     }
     if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
     trafficMeshes.push(mesh); scene.add(mesh);
@@ -1415,7 +1437,7 @@ function updateTraffic(dt){
     const lo=laneOffset(p.yaw,c.dir,c.lane);
     _ce.set(0,face,0);
     _cq.setFromEuler(_ce);
-    _cm.compose(_cp.set(p.x+lo.ox,0.05,p.z+lo.oz),_cq,_cs);
+    _cm.compose(_cp.set(p.x+lo.ox,0.02,p.z+lo.oz),_cq,_cs);
     trafficMeshes[c.ti].setMatrixAt(c.mi,_cm);
   }
   trafficMeshes.forEach(m=>m.instanceMatrix.needsUpdate=true);
