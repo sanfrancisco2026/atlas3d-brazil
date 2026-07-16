@@ -431,6 +431,7 @@ let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
 let weatherState=null, rainSys=null, climCache=null, simData=null;
+let labelGroup=null;
 let downXY = null;
 let prevT = performance.now();
 
@@ -788,8 +789,8 @@ function initThree(){
 
   cityGroup=new THREE.Group(); roadGroup=new THREE.Group();
   treeGroup=new THREE.Group(); routeGroup=new THREE.Group();
-  synGroup=new THREE.Group();
-  scene.add(cityGroup,roadGroup,treeGroup,routeGroup,synGroup);
+  synGroup=new THREE.Group(); labelGroup=new THREE.Group();
+  scene.add(cityGroup,roadGroup,treeGroup,routeGroup,synGroup,labelGroup);
 
   // sky + sun
   sky=new Sky(); sky.scale.setScalar(20000); scene.add(sky);
@@ -1181,6 +1182,7 @@ function ribbonGeometry(points,width,y){
 function buildRoads(osm){
   clearGroup(roadGroup); trafficPaths=[];
   pollutionCtx.majorKm=0; pollutionCtx.minorKm=0;
+  const namedRoads=[];
   const {cLat,cLon,mPerLon}=geoCtx;
   let totalKm=0;
   osm.elements.forEach(el=>{
@@ -1204,9 +1206,95 @@ function buildRoads(osm){
         cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
       trafficPaths.push({pts,cum,total:len,major});   // buses stick to major roads
     }
+    if(el.tags.name&&len>60&&(major||len>120))
+      namedRoads.push({name:el.tags.name,pts,len,major});
   });
   $('stRoads').textContent=totalKm.toFixed(1)+' km';
   log(`Road network: ${totalKm.toFixed(1)} km, ${trafficPaths.length} drivable segments`,'ok');
+  buildRoadLabels(namedRoads);
+}
+
+/* ---- street names painted flat on the roads ----
+   Names come from the OSM data itself when present (live Overpass
+   builds). The offline Geofabrik extracts don't carry the name field,
+   so in that case a lightweight Overpass query fetches just names +
+   geometry for the zone, asynchronously - the city renders first,
+   names fade in when they arrive. */
+// Pure (unit-tested): keep at most `perName` ways per street name,
+// preferring the longest, capped at `capN` total - avenues that OSM
+// splits into many segments would otherwise spam identical labels.
+function dedupeRoadNames(list,perName,capN){
+  const seen={};
+  return list.slice().sort((a,b)=>b.len-a.len).filter(r=>{
+    if((seen[r.name]||0)>=perName) return false;
+    seen[r.name]=(seen[r.name]||0)+1; return true;
+  }).slice(0,capN);
+}
+// Pure (unit-tested): yaw for a flat label so text runs along the road
+// and never reads upside-down. Scene axes: +x east, +z south.
+function labelYaw(dx,dz){
+  if(dx<0){ dx=-dx; dz=-dz; }        // flip so text reads left-to-right
+  return Math.atan2(-dz,dx);
+}
+function makeRoadLabelMesh(name){
+  const font='700 44px "Segoe UI",system-ui,sans-serif';
+  const probe=document.createElement('canvas').getContext('2d');
+  probe.font=font;
+  const w=Math.ceil(probe.measureText(name).width)+28;
+  const c=document.createElement('canvas'); c.width=w; c.height=68;
+  const x=c.getContext('2d');
+  x.font=font; x.textAlign='center'; x.textBaseline='middle';
+  x.lineWidth=9; x.lineJoin='round'; x.strokeStyle='rgba(8,12,20,.92)';
+  x.strokeText(name,w/2,34);
+  x.fillStyle='#eaf2ff'; x.fillText(name,w/2,34);
+  const t=new THREE.CanvasTexture(c);
+  t.colorSpace=THREE.SRGBColorSpace; t.anisotropy=8;
+  const h=4.4, g=new THREE.PlaneGeometry(h*w/68,h);
+  g.rotateX(-Math.PI/2);
+  return new THREE.Mesh(g,new THREE.MeshBasicMaterial({map:t,transparent:true,
+    depthWrite:false,opacity:.92}));
+}
+function placeRoadLabels(list){
+  if(!labelGroup) return;
+  const picked=dedupeRoadNames(list,2,90);
+  picked.forEach(r=>{
+    const cum=[0];
+    for(let i=0;i<r.pts.length-1;i++)
+      cum.push(cum[i]+Math.hypot(r.pts[i+1].x-r.pts[i].x,r.pts[i+1].z-r.pts[i].z));
+    const total=cum[cum.length-1]; if(total<40) return;
+    const p=pointOnPath({pts:r.pts,cum,total},total/2);
+    // direction at the midpoint segment
+    let i=0; while(i<cum.length-2&&cum[i+1]<total/2) i++;
+    const dx=r.pts[i+1].x-r.pts[i].x, dz=r.pts[i+1].z-r.pts[i].z;
+    const m=makeRoadLabelMesh(r.name);
+    m.position.set(p.x,0.42,p.z);
+    m.rotation.y=labelYaw(dx,dz);
+    labelGroup.add(m);
+  });
+  if(picked.length) log(`Street names: ${picked.length} labels on the roads`,'ok');
+}
+function buildRoadLabels(named){
+  labelGroup.children.forEach(c=>{
+    if(c.material){ if(c.material.map) c.material.map.dispose(); c.material.dispose(); }
+  });
+  clearGroup(labelGroup);
+  if(named.length){ placeRoadLabels(named); return; }
+  // offline dataset: names aren't in the extract - fetch just names+geometry
+  const b=geoCtx;
+  const q=`[out:json][timeout:25];way["highway"]["name"](${b.S},${b.W},${b.N},${b.E});out tags geom;`;
+  overpassAny(q).then(data=>{
+    const list=(data.elements||[])
+      .filter(e=>e.type==='way'&&e.tags&&e.tags.name&&e.geometry&&e.geometry.length>1)
+      .map(e=>{
+        const pts=e.geometry.map(g=>({x:(g.lon-b.cLon)*b.mPerLon,z:(b.cLat-g.lat)*M_LAT}));
+        let len=0;
+        for(let i=0;i<pts.length-1;i++) len+=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z);
+        const cls=ROAD_CLASS[e.tags.highway];
+        return {name:e.tags.name,pts,len,major:!!(cls&&cls[1]===1)};
+      })
+      .filter(r=>r.len>60&&(r.major||r.len>120));
+    placeRoadLabels(list);
+  }).catch(err=>log('Street names unavailable offline: '+err.message,'ai'));
 }
 
 /* ---- trees ---- */
@@ -2638,7 +2726,7 @@ $('resetBtn').addEventListener('click',()=>{
   $('zoomCtl').style.display='none';
   setRouteMode(false); hideBldCard(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
-  clearGroup(synGroup); synGroup.visible=true;
+  clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=true;
   $('synBtn').textContent='Synthetic infill: ON';
   plannerClear();
   removeTraffic();
