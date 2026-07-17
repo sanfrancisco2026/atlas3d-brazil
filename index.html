@@ -162,20 +162,12 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
      precedence (its areas share names/bounds with 17 of the Brazil-wide ones, and
      it's the more specific source for them) while keeping every other Brazil-wide
      area (Sao Paulo, Rio, Salvador, ...) as a fallback. -->
+<!-- Each dataset publishes its own global (shim line at end of each file);
+     atlas_merge.js (external, so defer actually works) combines them. -->
 <script src="atlas_local_brazil.js" defer></script>
-<script defer>window.ATLAS_LOCAL_BRAZIL = window.ATLAS_LOCAL;</script>
 <script src="atlas_local_goias.js" defer></script>
-<script defer>
-  (function(){
-    var goias = window.ATLAS_LOCAL, brazil = window.ATLAS_LOCAL_BRAZIL;
-    if (!goias || !brazil) return; // one of the datasets failed to load; keep whichever loaded
-    var goiasNames = new Set(goias.areas.map(function(a){ return a.name; }));
-    window.ATLAS_LOCAL = {
-      source: goias.source + ' + ' + brazil.source,
-      areas: goias.areas.concat(brazil.areas.filter(function(a){ return !goiasNames.has(a.name); }))
-    };
-  })();
-</script>
+<script src="atlas_local_southafrica.js" defer></script>
+<script src="atlas_merge.js" defer></script>
 </head>
 
 <body>
@@ -261,6 +253,26 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
         <option value="-15.7997,-47.8645,Esplanada, Brasilia">Bras&iacute;lia &middot; Esplanada dos Minist&eacute;rios</option>
         <option value="-20.4640,-54.6163,Campo Grande MS">Campo Grande &middot; MS</option>
         <option value="-15.5989,-56.0949,Cuiaba MT">Cuiab&aacute; &middot; MT</option>
+      </optgroup>
+      <optgroup label="South Africa">
+        <option value="-26.2044,28.0456,Johannesburg CBD">Johannesburg &middot; CBD</option>
+        <option value="-26.1076,28.0567,Sandton">Sandton &middot; Financial District</option>
+        <option value="-26.2485,27.8540,Soweto Orlando">Soweto &middot; Orlando</option>
+        <option value="-25.7461,28.1881,Pretoria Church Square">Pretoria &middot; Church Square</option>
+        <option value="-33.9221,18.4231,Cape Town City Bowl">Cape Town &middot; City Bowl</option>
+        <option value="-33.9036,18.4207,Cape Town Waterfront">Cape Town &middot; V&amp;A Waterfront</option>
+        <option value="-29.8587,31.0218,Durban CBD">Durban &middot; CBD</option>
+        <option value="-29.7263,31.0854,Umhlanga">Umhlanga &middot; Ridge</option>
+        <option value="-33.9608,25.6022,Gqeberha Port Elizabeth">Gqeberha (Port Elizabeth)</option>
+        <option value="-29.0852,26.1596,Bloemfontein">Bloemfontein</option>
+        <option value="-33.0153,27.9116,East London">East London</option>
+        <option value="-29.6006,30.3794,Pietermaritzburg">Pietermaritzburg</option>
+        <option value="-28.7382,24.7637,Kimberley">Kimberley</option>
+        <option value="-23.9045,29.4689,Polokwane">Polokwane</option>
+        <option value="-25.4753,30.9694,Mbombela Nelspruit">Mbombela (Nelspruit)</option>
+        <option value="-33.9346,18.8610,Stellenbosch">Stellenbosch</option>
+        <option value="-33.9648,22.4590,George">George</option>
+        <option value="-25.6667,27.2411,Rustenburg">Rustenburg</option>
       </optgroup>
       <optgroup label="World Icons">
         <option value="40.7580,-73.9855,Times Square, NYC">New York &middot; Midtown Manhattan</option>

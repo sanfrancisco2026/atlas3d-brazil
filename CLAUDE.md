@@ -14,16 +14,22 @@ two offline data files. There is no server, no package.json, no bundler — open
   Brazil, including 17 Goiás-state municipalities).
 - `atlas_local_goias.js` — offline Geofabrik centro-oeste/Goiás extract, same
   shape, covering those same 17 Goiás-area names as a dedicated regional source.
-- Both scripts are `defer`red and loaded in a fixed order, with two small inline
-  `<script defer>` snippets in between/after them in `index.html`'s `<head>`
-  that snapshot `window.ATLAS_LOCAL` after the Brazil script runs (into
-  `window.ATLAS_LOCAL_BRAZIL`), then, once the Goiás script runs and overwrites
-  `window.ATLAS_LOCAL`, merge the two: Goiás's 17 areas take precedence (by
-  name), and every other Brazil-wide area is concatenated in as fallback
-  coverage. Relative execution order of deferred classic scripts matches
-  document order, so this merge is guaranteed to run after both datasets have
-  loaded and before the `type="module"` script (also implicitly deferred) that
-  calls `localOSM()`.
+- `atlas_local_southafrica.js` — offline Geofabrik South Africa extract
+  (18 city areas: Johannesburg, Cape Town, Durban, Pretoria, Soweto, ...),
+  generated from `south-africa-260710-free.shp.zip` by a pyshp streaming
+  script. Assigns its own `window.ATLAS_LOCAL_SA` global (no clobbering), and
+  the head merge script concatenates its areas in (names never collide with
+  the Brazil sets).
+- Dataset loading: **`defer` is ignored on inline scripts** — an earlier inline
+  snapshot/merge ran at parse time and silently left `window.ATLAS_LOCAL` as
+  just the Goiás file in real browsers (Brazil-wide presets fell back to live
+  Overpass). The chain is now all-external: each dataset file ends with a
+  one-line shim publishing its own global (`ATLAS_LOCAL_BRAZIL`,
+  `ATLAS_LOCAL_GOIAS`, `ATLAS_LOCAL_SA`), and `atlas_merge.js` — an external
+  deferred script loaded last — combines them (Goiás beats Brazil-wide for the
+  17 shared names; South Africa concatenates). External deferred scripts
+  execute in document order, before the `type="module"` script that calls
+  `localOSM()`. 71 areas total in the merged set.
 
 ### Data flow
 1. User searches (Nominatim) or clicks the 2D Leaflet map to pick a capture zone.

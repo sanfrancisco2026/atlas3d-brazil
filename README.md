@@ -22,6 +22,8 @@ or open `index.html` directly in a browser (a local static server avoids any
 - `atlas_local_goias.js` — offline Goiás/centro-oeste OSM extract, merged with
   the Brazil-wide dataset at load time (Goiás areas take precedence — see
   [CLAUDE.md](CLAUDE.md)).
+- `atlas_local_southafrica.js` — offline South Africa OSM extract (18 city
+  areas), concatenated into the same merged dataset at load time.
 
 See [CLAUDE.md](CLAUDE.md) for architecture notes, data flow, and standing
 rules for ongoing work on this app.
