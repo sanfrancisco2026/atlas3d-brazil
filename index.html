@@ -692,31 +692,41 @@ function loadTile(z,x,y){
     img.src=`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
   });
 }
-async function fetchSatellite(b){
-  // pick zoom so the stitched image is ~1200-2600 px wide (z18 max: reliable global coverage)
-  let z=18;
-  while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > 2600) z--;
+async function stitchSatelliteAt(b,z){
   const xf0=lon2tile(b.W,z), xf1=lon2tile(b.E,z);
   const yf0=lat2tile(b.N,z), yf1=lat2tile(b.S,z);
   const w=Math.round((xf1-xf0)*256), h=Math.round((yf1-yf0)*256);
   const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
   const ctx=canvas.getContext('2d',{willReadFrequently:true});
   ctx.fillStyle='#182028'; ctx.fillRect(0,0,w,h);
-
-  const jobs=[];
+  const jobs=[]; let okTiles=0;
   for(let tx=Math.floor(xf0); tx<=Math.floor(xf1); tx++)
     for(let ty=Math.floor(yf0); ty<=Math.floor(yf1); ty++)
       jobs.push(loadTile(z,tx,ty).then(img=>{
-        if(img) ctx.drawImage(img,(tx-xf0)*256,(ty-yf0)*256);
+        if(img){ okTiles++; ctx.drawImage(img,(tx-xf0)*256,(ty-yf0)*256); }
       }));
   await Promise.all(jobs);
-
-  const imgData=ctx.getImageData(0,0,w,h);
-  const texture=new THREE.CanvasTexture(canvas);
+  return {canvas,w,h,okTiles,total:jobs.length};
+}
+async function fetchSatellite(b){
+  // pick zoom so the stitched image is ~1200-2600 px wide
+  let z=18;
+  while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > 2600) z--;
+  // Esri has no high-zoom imagery for many smaller towns: if most tiles
+  // 404 at this zoom, step down until the mosaic actually fills in.
+  let s=await stitchSatelliteAt(b,z);
+  while(s.okTiles<s.total*0.5 && z>13){
+    log(`Satellite: only ${s.okTiles}/${s.total} tiles at z${z} - retrying z${z-1}`,'ai');
+    z--; s=await stitchSatelliteAt(b,z);
+  }
+  const imgData=s.canvas.getContext('2d').getImageData(0,0,s.w,s.h);
+  const texture=new THREE.CanvasTexture(s.canvas);
   texture.colorSpace=THREE.SRGBColorSpace;
   texture.anisotropy=renderer.capabilities.getMaxAnisotropy();
-  log(`Satellite mosaic: ${jobs.length} tiles @ z${z} (${w}x${h}px)`,'ok');
-  return {texture,imgData,w,h};
+  log(`Satellite mosaic: ${s.okTiles}/${s.total} tiles @ z${z} (${s.w}x${s.h}px)`,'ok');
+  if(s.okTiles<s.total)
+    log('Some satellite tiles are unavailable here - gaps stay dark grey','ai');
+  return {texture,imgData,w:s.w,h:s.h};
 }
 function satPixel(lat,lon){
   if(!satData||!geoCtx) return new THREE.Color(.55,.55,.58);
@@ -791,6 +801,20 @@ function createRenderer(){
       return r;
     }catch(e){ lastErr=e; }
   }
+  // last resort: hand three.js a context we created ourselves (covers
+  // browsers where WebGL1 works but the default WebGL2 request fails)
+  try{
+    const cv=document.createElement('canvas');
+    const gl=cv.getContext('webgl2')||cv.getContext('webgl')||cv.getContext('experimental-webgl');
+    if(gl){
+      const r=new THREE.WebGLRenderer({canvas:cv,context:gl,antialias:false});
+      log('Graphics fallback: manually created '+(gl instanceof WebGL2RenderingContext?'WebGL2':'WebGL1')+' context','ai');
+      return r;
+    }
+  }catch(e){ lastErr=e; }
+  // report exactly what this browser offers, to guide the fix
+  const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
+  log(`Diagnostics - WebGL2: ${probe('webgl2')?'yes':'NO'} · WebGL1: ${probe('webgl')?'yes':'NO'}`,'err');
   throw lastErr||new Error('WebGL unavailable');
 }
 function initThree(){
@@ -2862,7 +2886,7 @@ $('buildBtn').addEventListener('click',async()=>{
   if(appState!=='map') return;
   if(!renderer){
     log('Cannot build: the 3D engine never started (WebGL unavailable).','err');
-    log('Enable hardware acceleration / WebGL in this browser, then reload.','err');
+    log('Close other tabs of this app, fully quit and reopen the browser, then hard-reload (Ctrl+Shift+R).','err');
     return;
   }
   appState='building';
@@ -2988,7 +3012,8 @@ try{
   // instead of letting the first Build die on "reading 'capabilities'".
   console.error('initThree failed:',err);
   log('3D engine failed to start: '+err.message,'err');
-  log('Enable hardware acceleration / WebGL in this browser, then reload.','err');
+  log('Close other tabs of this app, fully quit and reopen the browser, then hard-reload (Ctrl+Shift+R).','err');
+  log('If it persists: enable hardware acceleration, update the GPU driver, or avoid remote-desktop sessions.','err');
 }
 plannerInitUI();
 log('Search a place, or click the map, then BUILD','ai');
