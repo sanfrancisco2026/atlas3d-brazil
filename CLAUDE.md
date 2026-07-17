@@ -115,6 +115,16 @@ two offline data files. There is no server, no package.json, no bundler — open
    hydrants + a tank on the highest terrain cell). Badged "· simulated" via
    `layerEnable(k,n,true)`, disclaimed in `#simNote`, logged. Deterministic
    per location (mulberry32 seeded from cLat/cLon).
+13c. Analysis features: `solarPotential` (pure) sizes rooftop PV per building
+   (inspect card) and zone-wide (stat cell; real roofs only, 60%/200Wp/m²/
+   1650kWh-kWp assumptions). `buildGreenscape` classifies satellite pixels
+   (`isVegetated`, pure) vs building/road cells to overlay greenable ground
+   (layer + stat + green-roof count). `planCellTowers` (pure greedy
+   set-cover, candidates = all buildings) proposes towers over existing
+   OSM/simulated telecom sites (`telecomSites`) via the "Plan cell coverage"
+   button (280m microcells, cap 6). Hospitals & clinics is a real-data-only
+   planner layer (`isHealth` nodes/ways, never simulated). Tests:
+   solar/greenscape/cell_planner suites.
 14. 2D-map overlays: time machine (`gibsUrl`, pure) overlays dated NASA MODIS
    true-color imagery (2000→, date picker + opacity, maxNativeZoom 9); live
    radar toggle animates the last 8 RainViewer frames (`nextFrame`, pure).

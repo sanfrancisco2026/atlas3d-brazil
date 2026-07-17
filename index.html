@@ -2334,9 +2334,12 @@ const LAYER_DEFS=[   // [key, colour, label, font-awesome class]
  ['pipelines','#c98a3d','Oil & gas pipelines','fa-gas-pump'],
  ['telecom','#c77dff','Telecom & data infra','fa-tower-broadcast'],
  ['waterinf','#2fd4c0','Water & sanitation','fa-droplet'],
+ ['health', '#ff5e8e','Hospitals & clinics','fa-hospital'],
+ ['green',  '#3ddc84','Greenscape potential','fa-seedling'],
 ];
 let plannerGroups={}, lampGlowMat=null, windRotors=[];
 let plannerCnt=null, terrainGrid=null;
+let telecomSites=[], cellPlanGroup=null;
 /* OpenInfraMap-style voltage color ramp (data (c) OSM) */
 function parseVolt(v){ const a=String(v||'').split(/[;,]/).map(parseFloat).filter(n=>!isNaN(n));
   return a.length?Math.max(...a)/1000:0; }
@@ -2390,7 +2393,7 @@ function plannerInitUI(){
 function plannerClear(){
   Object.values(plannerGroups).forEach(g=>scene.remove(g));
   plannerGroups={}; lampGlowMat=null; windRotors=[];
-  plannerCnt=null; terrainGrid=null;
+  plannerCnt=null; terrainGrid=null; telecomSites=[];
   document.querySelectorAll('#layerList input').forEach(c=>{c.checked=false;c.disabled=true;});
   LAYER_DEFS.forEach(([k,,label])=>{const el=$('ly-'+k); if(el) el.textContent=label;});
   const sn=$('simNote'); if(sn) sn.style.display='none';
@@ -2415,6 +2418,7 @@ const FA_GLYPH={signal:'',bump:'',lamp:'',bolt:'',
 const faReady=(document.fonts&&document.fonts.load)
   ? document.fonts.load(FA_FONT,'').catch(()=>{})
   : Promise.resolve();
+FA_GLYPH.hosp='';   // fa-hospital
 const iconCache={};
 function iconTexture(kind,color){
   const key=kind+color;
@@ -2456,6 +2460,8 @@ function iconTexture(kind,color){
     x.bezierCurveTo(66,46,66,62,48,70); x.bezierCurveTo(30,62,30,46,48,24); x.fill();
     x.fillStyle='#0a0e16'; x.beginPath();
     x.moveTo(48,38); x.lineTo(57,54); x.lineTo(39,54); x.closePath(); x.fill();
+  }else if(kind==='hosp'){ // medical cross fallback
+    x.fillRect(41,26,14,44); x.fillRect(26,41,44,14);
   }
   const t=new THREE.CanvasTexture(c); t.colorSpace=THREE.SRGBColorSpace;
   iconCache[key]=t; return t;
@@ -2519,11 +2525,22 @@ async function buildPlannerLayers(b){
       node["telecom"](${b.S},${b.W},${b.N},${b.E});
       way["building"]["name"](${b.S},${b.W},${b.N},${b.E});
       node["amenity"~"^(school|hospital|clinic|university|police|fire_station)$"](${b.S},${b.W},${b.N},${b.E});
+      node["amenity"="doctors"](${b.S},${b.W},${b.N},${b.E});
+      way["amenity"~"^(hospital|clinic|doctors)$"](${b.S},${b.W},${b.N},${b.E});
+      node["healthcare"~"^(hospital|clinic|doctor)$"](${b.S},${b.W},${b.N},${b.E});
     );(._;>;);out body;`;
     const data=await overpassAny(q);
     const nd={}; data.elements.forEach(e=>{if(e.type==='node')nd[e.id]=e;});
     const inB=e=>e.lat>=b.S&&e.lat<=b.N&&e.lon>=b.W&&e.lon<=b.E;
-    const cnt={signals:0,bumps:0,lamps:0,lit:0,drainage:0,power:0,pipelines:0,telecom:0,waterinf:0,labels:0};
+    const cnt={signals:0,bumps:0,lamps:0,lit:0,drainage:0,power:0,pipelines:0,telecom:0,waterinf:0,labels:0,health:0};
+    const isHealth=t=>['hospital','clinic','doctors'].includes(t.amenity)
+      ||['hospital','clinic','doctor'].includes(t.healthcare);
+    const addHealth=(x,z,t)=>{
+      addIcon(PG('health'),'hosp','#ff5e8e',x,z,10,t.amenity==='hospital'?9:6.5);
+      groundDisc(PG('health'),x,z,t.amenity==='hospital'?200:90,0xff5e8e,0.06);
+      if(t.name){ const sp=textSprite(t.name,'#ffc3d6'); sp.position.set(x,18,z); PG('health').add(sp); }
+      cnt.health++;
+    };
     lampGlowMat=new THREE.MeshStandardMaterial({color:0x332200,emissive:0xffd27a,emissiveIntensity:0.3});
     const lampGeo=new THREE.SphereGeometry(0.7,8,8);
 
@@ -2557,12 +2574,14 @@ async function buildPlannerLayers(b){
           addIcon(PG('telecom'),'dc','#a55dff',x,z,4,3.5); cnt.telecom++; }
         else if(t.man_made==='mast'||t.man_made==='antenna'||t.man_made==='communications_tower'||t.telecom){
           addIcon(PG('telecom'),'wave','#c77dff',x,z,12,8);
-          groundDisc(PG('telecom'),x,z,320,0xc77dff,0.07); cnt.telecom++; }
+          groundDisc(PG('telecom'),x,z,320,0xc77dff,0.07); cnt.telecom++;
+          telecomSites.push({x,z,src:'osm'}); }
         else if(t.man_made==='water_tower'||t.man_made==='water_well'||t.man_made==='storage_tank'
              ||t.emergency==='fire_hydrant'||t.amenity==='drinking_water'){
           addIcon(PG('waterinf'),'drop','#2fd4c0',x,z,6,5.5);
           if(t.man_made) groundDisc(PG('waterinf'),x,z,180,0x2fd4c0,0.06);
           cnt.waterinf++; }
+        else if(isHealth(t)){ addHealth(x,z,t); }
         else if(t.amenity&&t.name){
           const sp=textSprite(t.name,'#ffe9b0'); sp.position.set(x,14,z);
           PG('labels').add(sp); cnt.labels++; }
@@ -2617,6 +2636,9 @@ async function buildPlannerLayers(b){
       }else if(t.traffic_calming){
         const mid=pts[Math.floor(pts.length/2)];
         addIcon(PG('bumps'),'bump','#ff9a3d',mid.x,mid.z,4,5.5); cnt.bumps++;
+      }else if(isHealth(t)){
+        let hx=0,hz=0; pts.forEach(p=>{hx+=p.x;hz+=p.z;});
+        addHealth(hx/pts.length,hz/pts.length,t);
       }else if(t.building&&t.name&&cnt.labels<120){
         let cx=0,cz=0,area=0; const P=pts.map(p=>new THREE.Vector2(p.x,p.z));
         P.forEach(p=>{cx+=p.x;cz+=p.y;}); cx/=P.length; cz/=P.length;
@@ -2680,6 +2702,153 @@ async function buildFloodLayer(b){
     `Low-lying / flood-prone (${Math.round(mn)}-${Math.round(mx)}m terrain)`;
   log(`Flood layer ready: terrain ${Math.round(mn)}m to ${Math.round(mx)}m`,'ok');
 }
+
+/* ============================================================
+   GREENSCAPE POTENTIAL
+   Where could this zone add vegetation? The satellite mosaic tells us
+   what is already green; building footprints and the road grid tell
+   us what ground is spoken for. What remains - paved lots, bare soil,
+   wide verges - is greenable ground, shown as a green overlay layer.
+   Large flat roofs are counted separately as green-roof candidates.
+============================================================ */
+// Pure (unit-tested): is this satellite pixel vegetated?
+function isVegetated(r,g,b){ return g>40 && g>r*1.06 && g>b*1.06; }
+const GREEN_N=36;
+function buildGreenscape(){
+  if(!satData||!geoCtx) return;
+  const {sceneW,sceneH}=geoCtx;
+  const cells=GREEN_N*GREEN_N;
+  const veg=new Uint8Array(cells), busy=new Uint8Array(cells);
+  // sample satellite greenness per cell (5x5 pixels)
+  const d=satData.imgData.data;
+  for(let cy=0;cy<GREEN_N;cy++)for(let cx=0;cx<GREEN_N;cx++){
+    let g=0,n=0;
+    for(let sy=0;sy<5;sy++)for(let sx=0;sx<5;sx++){
+      const u=(cx+(sx+0.5)/5)/GREEN_N, v=(cy+(sy+0.5)/5)/GREEN_N;
+      const px=Math.min(satData.w-1,Math.floor(u*satData.w));
+      const py=Math.min(satData.h-1,Math.floor(v*satData.h));
+      const i=(py*satData.w+px)*4;
+      if(isVegetated(d[i],d[i+1],d[i+2])) g++;
+      n++;
+    }
+    if(g/n>=0.35) veg[cy*GREEN_N+cx]=1;
+  }
+  const cellOf=(x,z)=>{
+    const cx=Math.floor((x/sceneW+0.5)*GREEN_N), cy=Math.floor((z/sceneH+0.5)*GREEN_N);
+    return (cx>=0&&cx<GREEN_N&&cy>=0&&cy<GREEN_N)?cy*GREEN_N+cx:-1;
+  };
+  // ground spoken for: buildings + roads
+  let roofCandidates=0;
+  cityGroup.children.concat(synGroup.children).forEach(m=>{
+    if(!m.userData||!m.userData.lat) return;
+    const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
+    const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
+    const ci=cellOf(x,z); if(ci>=0) busy[ci]=1;
+    if(m.userData.area>=600&&m.userData.src!=='typo') roofCandidates++;
+  });
+  trafficPaths.forEach(p=>{ for(let dd=0;dd<p.total;dd+=14){
+    const pt=pointOnPath(p,dd); const ci=cellOf(pt.x,pt.z); if(ci>=0) busy[ci]=1; }});
+  // potential = not green yet, not built, not road
+  let pot=0;
+  const c=document.createElement('canvas'); c.width=c.height=256;
+  const x2=c.getContext('2d'); const cs=256/GREEN_N;
+  x2.filter='blur(4px)'; x2.fillStyle='rgba(61,220,132,.4)';
+  for(let i=0;i<cells;i++){
+    if(veg[i]||busy[i]) continue;
+    pot++;
+    x2.fillRect((i%GREEN_N)*cs,Math.floor(i/GREEN_N)*cs,cs,cs);
+  }
+  const t=new THREE.CanvasTexture(c);
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(sceneW,sceneH),
+    new THREE.MeshBasicMaterial({map:t,transparent:true,depthWrite:false}));
+  m.rotation.x=-Math.PI/2; m.position.y=0.38; PG('green').add(m);
+  const pct=Math.round(pot/cells*100);
+  $('stGreen').textContent=pct+'%';
+  $('stGreen').title=`${pct}% of ground cells are neither vegetated, built, nor road - candidates for parks/trees. Plus ${roofCandidates} large flat roofs suitable for green roofs.`;
+  layerEnable('green',pot);
+  $('ly-green').textContent=`Greenscape potential (${pct}% ground + ${roofCandidates} roofs)`;
+  log(`Greenscape: ~${pct}% of ground could be greened; ${roofCandidates} green-roof candidates`,'ai');
+}
+
+/* ============================================================
+   CELL COVERAGE PLANNER
+   Demand = every real building. Existing sites (OSM masts/antennas,
+   plus presumed rooftop sites when simulated) are honoured first;
+   a greedy set-cover then proposes the fewest extra towers - placed
+   at the densest uncovered spots - until dead zones are gone (or the
+   cap is hit). Urban microcell radius ~280m.
+============================================================ */
+const CELL_R=280, CELL_MAX_NEW=6;
+// Pure (unit-tested) greedy set-cover.
+function planCellTowers(demand,existing,R,maxNew){
+  const R2=R*R;
+  const inR=(a,b)=>(a.x-b.x)*(a.x-b.x)+(a.z-b.z)*(a.z-b.z)<=R2;
+  let uncovered=demand.map((d,i)=>i).filter(i=>!existing.some(e=>inR(demand[i],e)));
+  const total=Math.max(1,demand.length);
+  const beforeFrac=1-uncovered.length/total;
+  const newSites=[];
+  while(uncovered.length&&newSites.length<maxNew){
+    // candidate sites = every building (a covered rooftop can still host
+    // the tower that serves uncovered neighbours); score = uncovered reach
+    let best=-1,bestCov=[];
+    for(let ci=0;ci<demand.length;ci++){
+      const cov=uncovered.filter(i=>inR(demand[i],demand[ci]));
+      if(cov.length>bestCov.length){ best=ci; bestCov=cov; }
+    }
+    if(best<0) break;
+    newSites.push({x:demand[best].x,z:demand[best].z,covers:bestCov.length});
+    const rm=new Set(bestCov);
+    uncovered=uncovered.filter(i=>!rm.has(i));
+  }
+  return {newSites,beforeFrac,afterFrac:1-uncovered.length/total,
+          deadZone:uncovered.length};
+}
+function clearCellPlan(){
+  if(!cellPlanGroup) return;
+  scene.remove(cellPlanGroup);
+  cellPlanGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+  cellPlanGroup=null;
+  $('cellBtn').innerHTML='&#128246; Plan cell coverage';
+  $('cellBtn').classList.remove('active-mode');
+}
+function runCellPlan(){
+  if(appState!=='city') return;
+  if(cellPlanGroup){ clearCellPlan(); return; }   // toggle off
+  const demand=cityGroup.children.filter(m=>m.userData&&m.userData.lat).map(m=>({
+    x:(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon,
+    z:(geoCtx.cLat-m.userData.lat)*M_LAT}));
+  if(!demand.length){ log('Cell planner: no mapped buildings to cover','err'); return; }
+  const plan=planCellTowers(demand,telecomSites,CELL_R,CELL_MAX_NEW);
+  cellPlanGroup=new THREE.Group();
+  const disc=(x,z,color,op)=>{
+    const m=new THREE.Mesh(new THREE.CircleGeometry(CELL_R,48),
+      new THREE.MeshBasicMaterial({color,transparent:true,opacity:op,depthWrite:false}));
+    m.rotation.x=-Math.PI/2; m.position.set(x,0.5,z); cellPlanGroup.add(m);
+    const ring=new THREE.Mesh(new THREE.RingGeometry(CELL_R-3,CELL_R,64),
+      new THREE.MeshBasicMaterial({color,transparent:true,opacity:Math.min(1,op*6),depthWrite:false,side:THREE.DoubleSide}));
+    ring.rotation.x=-Math.PI/2; ring.position.set(x,0.55,z); cellPlanGroup.add(ring);
+  };
+  telecomSites.forEach(s=>disc(s.x,s.z,0xc77dff,0.06));
+  plan.newSites.forEach(s=>{
+    disc(s.x,s.z,0x4dff9d,0.08);
+    const im=new THREE.SpriteMaterial({map:iconTexture('wave','#4dff9d'),transparent:true,depthWrite:false});
+    const sp=new THREE.Sprite(im); sp.position.set(s.x,26,s.z); sp.scale.set(11,11,1);
+    cellPlanGroup.add(sp);
+    const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.4,24,6),
+      new THREE.MeshStandardMaterial({color:0x3a4048,roughness:.8}));
+    pole.position.set(s.x,12,s.z); cellPlanGroup.add(pole);
+  });
+  scene.add(cellPlanGroup);
+  const pct=v=>Math.round(v*100)+'%';
+  log(`Cell coverage: ${telecomSites.length} existing site(s) cover ${pct(plan.beforeFrac)} of buildings`,'ai');
+  log(plan.newSites.length
+    ? `+${plan.newSites.length} proposed tower(s) -> ${pct(plan.afterFrac)} covered`+
+      (plan.deadZone?` (${plan.deadZone} buildings still out of reach at the ${CELL_MAX_NEW}-tower cap)`:' - no dead zones')
+    : `no new towers needed - coverage already ${pct(plan.afterFrac)}`,'ok');
+  $('cellBtn').innerHTML='&#128246; Coverage plan: ON';
+  $('cellBtn').classList.add('active-mode');
+}
+$('cellBtn').addEventListener('click',runCellPlan);
 
 /* ============================================================
    SIMULATED INFRASTRUCTURE LAYERS
@@ -2779,6 +2948,7 @@ function simulatePlannerGaps(){
       const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
       const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
       addIcon(PG('telecom'),'wave','#c77dff',x,z,m.userData.h+10,7);
+      telecomSites.push({x,z,src:'simulated'});
     });
     if(tall.length){ layerEnable('telecom',tall.length,true); simulated.push('cell sites'); }
   }
@@ -2991,6 +3161,7 @@ $('buildBtn').addEventListener('click',async()=>{
 
     // planner overlays + optional photo facades (async, non-blocking)
     plannerClear();
+    buildGreenscape();          // after the clear, or it would be wiped
     buildPlannerLayers(b);
     applyObliqueFacades(b);
     applyAirQuality(b);
@@ -3018,6 +3189,9 @@ $('resetBtn').addEventListener('click',()=>{
   plannerClear();
   removeTraffic();
   $('fleetLegend').innerHTML=''; $('fleetTotal').textContent='0';
+  $('stSolar').innerHTML='&mdash;'; $('stSolar').title='';
+  $('stGreen').innerHTML='&mdash;'; $('stGreen').title='';
+  clearCellPlan();
   clearPollutionFX(); aqState=null;
   $('stAQ').innerHTML='&mdash;'; $('stAQ').style.color=''; $('stAQ').title='';
   removeLamps(); nightCalib=1;
