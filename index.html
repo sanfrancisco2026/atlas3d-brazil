@@ -360,6 +360,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <div class="slider-row" style="margin-top:12px"><span>Traffic fleet</span><b id="fleetTotal">0</b></div>
     <div id="fleetLegend" style="display:flex;gap:12px;flex-wrap:wrap;font-size:.72rem;color:#93a3bc"></div>
 
+    <button id="cellBtn" class="ghost" style="margin-top:12px">&#128246; Plan cell coverage</button>
+
     <div id="stats" style="display:grid">
       <div class="stat"><span class="v" id="stBuildings">0</span><span class="k">Real buildings</span></div>
       <div class="stat"><span class="v" id="stSynth" style="color:#8fb8ff">0</span><span class="k">Synthetic infill</span></div>
@@ -367,6 +369,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <div class="stat"><span class="v" id="stRoads">0 km</span><span class="k">Road network</span></div>
       <div class="stat"><span class="v" id="stCoverage">0%</span><span class="k">OSM z-tagged</span></div>
       <div class="stat"><span class="v" id="stAQ">&mdash;</span><span class="k">PM2.5 &micro;g/m&sup3;</span></div>
+      <div class="stat"><span class="v" id="stSolar">&mdash;</span><span class="k">Solar roof potential</span></div>
+      <div class="stat"><span class="v" id="stGreen">&mdash;</span><span class="k">Greenable ground</span></div>
     </div>
 
     <div class="slider-row" style="margin-top:16px"><span>Planner layers (OSM open data)</span><b id="lyCount">...</b></div>
@@ -400,6 +404,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Floors (est.)</span><b id="bcF">-</b></div>
   <div class="bc-row"><span>Footprint</span><b id="bcA">-</b></div>
   <div class="bc-row"><span>Height source</span><b id="bcS">-</b></div>
+  <div class="bc-row"><span>Solar roof (est.)</span><b id="bcSolar">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
 <div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS</div>
@@ -788,6 +793,25 @@ function estimateHeight(tags,areaM2,seedRand){
   if(areaM2>2200&&(t==='office'||t==='commercial'||t==='hotel'||t==='apartments'))
     est*=1.25+seedRand()*0.7;
   return {h:clamp(est,3,650),tagged:false};
+}
+
+/* ============================================================
+   SOLAR ROOF POTENTIAL
+   Rule-of-thumb PV sizing from the roof footprint: ~60% of a roof is
+   usable after setbacks/HVAC/shading, modern panels deliver ~200Wp/m2,
+   and Brazil/South Africa insolation yields ~1650 kWh per kWp a year.
+============================================================ */
+const SOLAR={usable:0.60, kwpPerM2:0.20, yieldKwhPerKwp:1650};
+// Pure (unit-tested): footprint m2 -> usable area, peak kW, annual MWh
+function solarPotential(footprintM2){
+  const usableM2=Math.max(0,footprintM2||0)*SOLAR.usable;
+  const kwp=usableM2*SOLAR.kwpPerM2;
+  return {usableM2:Math.round(usableM2),
+          kwp:Math.round(kwp*10)/10,
+          mwhYear:Math.round(kwp*SOLAR.yieldKwhPerKwp/100)/10};
+}
+function fmtKwp(kwp){
+  return kwp>=1000?(kwp/1000).toFixed(1)+' MWp':Math.round(kwp)+' kWp';
 }
 
 /* ============================================================
@@ -1211,6 +1235,12 @@ function buildBuildings(osm){
   });
 
   const real=count-synCount;
+  // zone-wide PV potential over real (OSM-mapped) roofs only
+  let totKwp=0;
+  cityGroup.children.forEach(m=>{ if(m.userData&&m.userData.area) totKwp+=solarPotential(m.userData.area).kwp; });
+  $('stSolar').textContent=real?fmtKwp(totKwp):'—';
+  $('stSolar').title=`~${Math.round(totKwp*SOLAR.yieldKwhPerKwp/1000).toLocaleString()} MWh/year across ${real} mapped roofs (60% usable, 200Wp/m², est.)`;
+  if(real) log(`Solar potential: ${fmtKwp(totKwp)} across ${real} mapped roofs (est.)`,'ai');
   $('stBuildings').textContent=real.toLocaleString();
   $('stSynth').textContent=synCount.toLocaleString();
   $('stTallest').textContent=Math.round(tallest)+' m';
@@ -2120,6 +2150,8 @@ function selectBuilding(mesh,cx,cy){
   $('bcA').textContent=(u.area||0).toLocaleString()+' m²';
   const [label,cls]=SRC_LABEL[u.src]||SRC_LABEL.typo;
   $('bcS').textContent=label; $('bcS').className=cls;
+  const sol=solarPotential(u.area);
+  $('bcSolar').textContent=`${sol.usableM2} m² · ${sol.kwp} kWp · ${sol.mwhYear} MWh/y`;
   const card=$('bldCard'); card.style.display='block';
   card.style.left=Math.min(cx+16,innerWidth-236)+'px';
   card.style.top=Math.max(12,Math.min(cy-10,innerHeight-190))+'px';
