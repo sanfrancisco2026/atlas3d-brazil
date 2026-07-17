@@ -815,6 +815,11 @@ function createRenderer(){
   // report exactly what this browser offers, to guide the fix
   const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
   log(`Diagnostics - WebGL2: ${probe('webgl2')?'yes':'NO'} · WebGL1: ${probe('webgl')?'yes':'NO'}`,'err');
+  log('Browser: '+navigator.userAgent,'err');
+  log('Both NO here = THIS page is blocked from WebGL. Usual causes: a privacy/'+
+      'ad-block extension (fingerprint protection), Brave shields, or opening the '+
+      'app in an embedded preview instead of a real browser tab. Try an '+
+      'incognito/InPrivate window with extensions off, or another browser.','err');
   throw lastErr||new Error('WebGL unavailable');
 }
 function initThree(){
