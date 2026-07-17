@@ -771,8 +771,30 @@ function estimateHeight(tags,areaM2,seedRand){
 /* ============================================================
    THREE.JS CORE
 ============================================================ */
+function createRenderer(){
+  // Try progressively humbler context profiles: machines whose discrete
+  // GPU / driver refuses a high-performance antialiased context often
+  // still grant a default or even software-rendered one.
+  const profiles=[
+    [{antialias:true, powerPreference:'high-performance'}, null],
+    [{antialias:false,powerPreference:'default'},
+      'Graphics fallback: default GPU profile (no antialiasing)'],
+    [{antialias:false,powerPreference:'low-power',
+      failIfMajorPerformanceCaveat:false,depth:true},
+      'Graphics fallback: reduced/software rendering mode - expect low FPS'],
+  ];
+  let lastErr;
+  for(const [opts,note] of profiles){
+    try{
+      const r=new THREE.WebGLRenderer(opts);
+      if(note) log(note,'ai');
+      return r;
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('WebGL unavailable');
+}
 function initThree(){
-  renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+  renderer=createRenderer();
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   renderer.setSize(innerWidth,innerHeight);
   renderer.shadowMap.enabled=true;
