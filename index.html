@@ -308,8 +308,16 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="histBtn" class="ghost">Historic: OFF</button>
       <button id="radarBtn" class="ghost">Live radar: OFF</button>
     </div>
+    <label class="small">IBGE territorial mesh (Brazil)</label>
+    <select id="ibgeLevel">
+      <option value="municipality" selected>Municipality boundary</option>
+      <option value="municipal-mesh">Municipal mesh &mdash; whole state</option>
+      <option value="micro">Microregions (state)</option>
+      <option value="meso">Mesoregions (state)</option>
+      <option value="state">State outline</option>
+    </select>
     <div class="btn-row">
-      <button id="ibgeBtn" class="ghost">IBGE boundary: OFF</button>
+      <button id="ibgeBtn" class="ghost">IBGE mesh: OFF</button>
     </div>
 
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
@@ -1632,29 +1640,65 @@ async function applyIBGE(){
     }
   }catch(err){ el.textContent='IBGE lookup unavailable: '+err.message; }
 }
-async function toggleIbgeBoundary(){
-  const btn=$('ibgeBtn');
-  if(ibgeBoundary){
-    map.removeLayer(ibgeBoundary); ibgeBoundary=null;
-    btn.textContent='IBGE boundary: OFF'; btn.classList.remove('active-mode');
-    return;
-  }
-  btn.textContent='IBGE boundary: ...';
+// Pure (unit-tested): the UF (state) code is the first two digits of a
+// municipal geocode; Brazilian UFs run 11 (RO) through 53 (DF).
+function ufFromCode(code){
+  const uf=parseInt(String(code||'').slice(0,2),10);
+  return (uf>=11&&uf<=53)?String(uf):null;
+}
+// Pure (unit-tested): malhas API URL for each territorial-mesh level
+// (IBGE municipal-mesh product; the state form accepts intrarregiao =
+// municipio | microrregiao | mesorregiao only - verified live).
+function malhaUrl(level,code){
+  const B='https://servicodados.ibge.gov.br/api/v3/malhas/';
+  const F='formato=application/vnd.geo%2Bjson';
+  const uf=ufFromCode(code);
+  if(level==='municipality') return `${B}municipios/${code}?${F}`;
+  if(!uf) return null;
+  if(level==='municipal-mesh') return `${B}estados/${uf}?${F}&intrarregiao=municipio&qualidade=minima`;
+  if(level==='micro') return `${B}estados/${uf}?${F}&intrarregiao=microrregiao&qualidade=minima`;
+  if(level==='meso') return `${B}estados/${uf}?${F}&intrarregiao=mesorregiao&qualidade=minima`;
+  if(level==='state') return `${B}estados/${uf}?${F}&qualidade=minima`;
+  return null;
+}
+const MESH_STYLE={
+  'municipality':{color:'#38e1ff',weight:2,dashArray:'6 6'},
+  'municipal-mesh':{color:'#7fd0ff',weight:1,dashArray:'3 4'},
+  'micro':{color:'#ffd24d',weight:1.5,dashArray:'5 5'},
+  'meso':{color:'#ff9a3d',weight:2,dashArray:'8 5'},
+  'state':{color:'#ff5e8e',weight:2.5,dashArray:''},
+};
+const MESH_LABEL={'municipality':'municipality','municipal-mesh':'municipal mesh',
+  'micro':'microregions','meso':'mesoregions','state':'state outline'};
+const meshCache={};
+function clearIbgeMesh(){
+  if(ibgeBoundary){ map.removeLayer(ibgeBoundary); ibgeBoundary=null; }
+  $('ibgeBtn').textContent='IBGE mesh: OFF';
+  $('ibgeBtn').classList.remove('active-mode');
+}
+async function showIbgeMesh(){
+  const btn=$('ibgeBtn'), level=$('ibgeLevel').value;
+  btn.textContent='IBGE mesh: ...';
   try{
     const c=map.getCenter();
     const info=await fetchIBGE(c.lat,c.lng);
-    if(!info) throw new Error('Brazilian municipalities only');
-    const gj=await (await fetch(`https://servicodados.ibge.gov.br/api/v3/malhas/municipios/${info.code}?formato=application/vnd.geo%2Bjson`)).json();
-    ibgeBoundary=L.geoJSON(gj,{style:{color:'#38e1ff',weight:2,dashArray:'6 6',
-      fillColor:'#38e1ff',fillOpacity:0.03}}).addTo(map);
-    btn.textContent='IBGE: '+info.name; btn.classList.add('active-mode');
-    log(`IBGE boundary: ${info.name} (${info.code})`,'ok');
-  }catch(err){
-    btn.textContent='IBGE boundary: OFF';
-    log('IBGE boundary: '+err.message,'err');
-  }
+    if(!info) throw new Error('Brazilian territory only');
+    const url=malhaUrl(level,info.code);
+    if(!url) throw new Error('mesh level unavailable');
+    const key=level+':'+info.code;
+    if(!meshCache[key]) meshCache[key]=await (await fetch(url)).json();
+    if(ibgeBoundary) map.removeLayer(ibgeBoundary);
+    const st=MESH_STYLE[level];
+    ibgeBoundary=L.geoJSON(meshCache[key],{style:{...st,
+      fillColor:st.color,fillOpacity:0.02}}).addTo(map);
+    const n=(meshCache[key].features||[]).length;
+    btn.textContent=`IBGE: ${MESH_LABEL[level]}${n>1?' ('+n+')':''}`;
+    btn.classList.add('active-mode');
+    log(`IBGE mesh: ${MESH_LABEL[level]} - ${n} feature(s), ${level==='municipality'?info.name:'UF '+ufFromCode(info.code)}`,'ok');
+  }catch(err){ clearIbgeMesh(); log('IBGE mesh: '+err.message,'err'); }
 }
-$('ibgeBtn').addEventListener('click',toggleIbgeBoundary);
+$('ibgeBtn').addEventListener('click',()=>{ ibgeBoundary?clearIbgeMesh():showIbgeMesh(); });
+$('ibgeLevel').addEventListener('change',()=>{ if(ibgeBoundary) showIbgeMesh(); });
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)

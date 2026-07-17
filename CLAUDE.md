@@ -153,8 +153,12 @@ No required API keys. All backing services are free/public:
 - Open-Meteo (current weather + ERA5 archive back to 1980) — public, no key.
 - RainViewer (live precipitation radar frames) — public, no key.
 - IBGE servicodados API (municipal area, population estimates, boundary
-  GeoJSON) — public, no key, CORS `*`. Municipality resolved from build
-  coordinates via Nominatim reverse + `IBGE:GEOCODIGO` extratag.
+  GeoJSON, territorial meshes) — public, no key, CORS `*`. Municipality
+  resolved from build coordinates via Nominatim reverse + `IBGE:GEOCODIGO`
+  extratag. The 2D-map mesh selector (`malhaUrl`, pure) serves the municipal-
+  mesh product at five levels: single municipality, whole-state municipal
+  mesh (`intrarregiao=municipio`), micro/mesoregions, state outline — the
+  state form accepts ONLY municipio|microrregiao|mesorregiao (verified live).
 - Goiânia geo360 cadastral portal — data APIs are behind municipal auth
   (tile gateway returns 401); the app links out to the portal for Goiânia
   builds instead of consuming it. Do not attempt to bypass its auth.
