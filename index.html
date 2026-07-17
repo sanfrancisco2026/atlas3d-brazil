@@ -167,6 +167,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <script src="atlas_local_brazil.js" defer></script>
 <script src="atlas_local_goias.js" defer></script>
 <script src="atlas_local_southafrica.js" defer></script>
+<script src="atlas_ibge_mesh.js" defer></script>
 <script src="atlas_merge.js" defer></script>
 </head>
 
@@ -319,6 +320,17 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <div class="btn-row">
       <button id="ibgeBtn" class="ghost">IBGE mesh: OFF</button>
     </div>
+
+    <label class="small">IBGE geoscience overlay (Brazil)</label>
+    <select id="geoSciLayer">
+      <option value="" selected>&mdash; none &mdash;</option>
+      <option value="BDIA:vege_area">Vegetation</option>
+      <option value="BDIA:pedo_area">Soils / pedology</option>
+      <option value="BDIA:geom_area">Geomorphology / relief</option>
+      <option value="BDIA:geol_area">Geology</option>
+    </select>
+    <div class="slider-row"><span>Geoscience opacity</span><b id="geoSciOpVal">60%</b></div>
+    <input type="range" id="geoSciOp" min="10" max="100" step="5" value="60">
 
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
@@ -1670,6 +1682,22 @@ const MESH_STYLE={
 };
 const MESH_LABEL={'municipality':'municipality','municipal-mesh':'municipal mesh',
   'micro':'microregions','meso':'mesoregions','state':'state outline'};
+// Pure (unit-tested): resolve a mesh level from the offline bundle
+// (atlas_ibge_mesh.js -> window.ATLAS_IBGE_MESH). Returns null when the
+// bundle or the requested slice is missing - caller falls back to the API.
+function meshFromBundle(M,level,code){
+  if(!M) return null;
+  const uf=ufFromCode(code); if(!uf) return null;
+  const pick=(fc,id)=>{ const f=((fc&&fc.features)||[])
+      .filter(f=>f.properties&&String(f.properties.codarea)===String(id));
+    return f.length?{type:'FeatureCollection',features:f}:null; };
+  if(level==='municipality') return pick(M.municipal&&M.municipal[uf],code);
+  if(level==='municipal-mesh') return (M.municipal&&M.municipal[uf])||null;
+  if(level==='micro') return (M.micro&&M.micro[uf])||null;
+  if(level==='meso') return (M.meso&&M.meso[uf])||null;
+  if(level==='state') return pick(M.states,uf);
+  return null;
+}
 const meshCache={};
 function clearIbgeMesh(){
   if(ibgeBoundary){ map.removeLayer(ibgeBoundary); ibgeBoundary=null; }
@@ -1683,10 +1711,17 @@ async function showIbgeMesh(){
     const c=map.getCenter();
     const info=await fetchIBGE(c.lat,c.lng);
     if(!info) throw new Error('Brazilian territory only');
-    const url=malhaUrl(level,info.code);
-    if(!url) throw new Error('mesh level unavailable');
     const key=level+':'+info.code;
-    if(!meshCache[key]) meshCache[key]=await (await fetch(url)).json();
+    let src='offline bundle';
+    if(!meshCache[key]){
+      meshCache[key]=meshFromBundle(window.ATLAS_IBGE_MESH,level,info.code);
+      if(!meshCache[key]){                       // bundle missing -> live API
+        const url=malhaUrl(level,info.code);
+        if(!url) throw new Error('mesh level unavailable');
+        meshCache[key]=await (await fetch(url)).json();
+        src='live API';
+      }
+    }
     if(ibgeBoundary) map.removeLayer(ibgeBoundary);
     const st=MESH_STYLE[level];
     ibgeBoundary=L.geoJSON(meshCache[key],{style:{...st,
@@ -1694,11 +1729,33 @@ async function showIbgeMesh(){
     const n=(meshCache[key].features||[]).length;
     btn.textContent=`IBGE: ${MESH_LABEL[level]}${n>1?' ('+n+')':''}`;
     btn.classList.add('active-mode');
-    log(`IBGE mesh: ${MESH_LABEL[level]} - ${n} feature(s), ${level==='municipality'?info.name:'UF '+ufFromCode(info.code)}`,'ok');
+    log(`IBGE mesh: ${MESH_LABEL[level]} - ${n} feature(s), ${level==='municipality'?info.name:'UF '+ufFromCode(info.code)} (${src})`,'ok');
   }catch(err){ clearIbgeMesh(); log('IBGE mesh: '+err.message,'err'); }
 }
 $('ibgeBtn').addEventListener('click',()=>{ ibgeBoundary?clearIbgeMesh():showIbgeMesh(); });
 $('ibgeLevel').addEventListener('change',()=>{ if(ibgeBoundary) showIbgeMesh(); });
+
+/* ---- IBGE geoscience WMS overlays (BDIA thematic layers) ----
+   Vegetation / soils / geomorphology / geology from IBGE's public
+   GeoServer, rendered as WMS tiles over the 2D map. Layer names were
+   taken from the live GetCapabilities and a GetMap render was
+   verified before shipping. Tiles are Brazil-only coverage. */
+let geoSciObj=null;
+function setGeoSci(){
+  const name=$('geoSciLayer').value;
+  if(geoSciObj){ map.removeLayer(geoSciObj); geoSciObj=null; }
+  if(!name) return;
+  geoSciObj=L.tileLayer.wms('https://geoservicos.ibge.gov.br/geoserver/wms',{
+    layers:name,format:'image/png',transparent:true,version:'1.1.1',
+    opacity:+$('geoSciOp').value/100,
+    attribution:'Geosciences: IBGE BDIA'}).addTo(map);
+  log('IBGE geoscience overlay: '+$('geoSciLayer').selectedOptions[0].textContent+' (Brazil coverage)','ok');
+}
+$('geoSciLayer').addEventListener('change',setGeoSci);
+$('geoSciOp').addEventListener('input',()=>{
+  $('geoSciOpVal').textContent=$('geoSciOp').value+'%';
+  if(geoSciObj) geoSciObj.setOpacity(+$('geoSciOp').value/100);
+});
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)
