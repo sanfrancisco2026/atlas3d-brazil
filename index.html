@@ -308,6 +308,9 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="histBtn" class="ghost">Historic: OFF</button>
       <button id="radarBtn" class="ghost">Live radar: OFF</button>
     </div>
+    <div class="btn-row">
+      <button id="ibgeBtn" class="ghost">IBGE boundary: OFF</button>
+    </div>
 
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
@@ -340,6 +343,13 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <div class="slider-row"><span>Simulation year</span><b id="simVal">&mdash;</b></div>
       <input type="range" id="simSlider" min="1980" max="2035" step="1" value="2026">
     </div>
+
+    <div class="slider-row" style="margin-top:12px"><span>Municipality (IBGE)</span><b></b></div>
+    <p class="hint" id="ibgeInfo"></p>
+    <a id="g360Link" target="_blank" rel="noopener" style="display:none;text-align:center;
+      text-decoration:none;padding:9px;border:1px solid #33405a;border-radius:7px;color:#93a3bc;
+      font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;margin-top:6px">
+      Goi&acirc;nia cadastral portal (geo360) &#8599;</a>
     <div class="slider-row"><span>Atmosphere / mist</span><b id="fogVal">10%</b></div>
     <input type="range" id="fogSlider" min="0" max="100" step="1" value="10">
 
@@ -407,7 +417,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Solar roof (est.)</span><b id="bcSolar">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
-<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS</div>
+<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE</div>
 
 <!-- ================= LOADER ================= -->
 <div id="loader">
@@ -1549,6 +1559,102 @@ function updateTraffic(dt){
   }
   trafficMeshes.forEach(m=>m.instanceMatrix.needsUpdate=true);
 }
+
+/* ============================================================
+   IBGE MUNICIPAL DATA (Brazil official geosciences/statistics)
+   The build location is reverse-geocoded (Nominatim, extratags) to an
+   IBGE municipality geocode; servicodados.ibge.gov.br (keyless, CORS
+   open) then supplies the official territorial area, the latest
+   population estimate (agregado 6579), and the municipal boundary
+   polygon for the 2D map. Goiânia builds additionally get a link to
+   the city's geo360 cadastral portal - its data APIs sit behind
+   municipal authentication (tile gateway answers 401), so we link to
+   the portal rather than scraping it.
+============================================================ */
+// Pure (unit-tested): pull the IBGE geocode out of OSM extratags
+function ibgeCodeFrom(extratags){
+  if(!extratags) return null;
+  return extratags['IBGE:GEOCODIGO']||extratags['ibge:geocodigo']
+       ||extratags['IBGE:geocodigo']||null;
+}
+// Pure (unit-tested): people per km2, null-safe
+function ibgeDensity(pop,areaKm2){
+  return (pop>0&&areaKm2>0)?Math.round(pop/areaKm2):null;
+}
+let ibgeCache={}, ibgeBoundary=null;
+async function fetchIBGE(lat,lon){
+  const rev=await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}`+
+    `&format=jsonv2&extratags=1&zoom=10`,{headers:{'Accept':'application/json'}});
+  if(!rev.ok) throw new Error('reverse geocode HTTP '+rev.status);
+  const j=await rev.json();
+  const code=ibgeCodeFrom(j.extratags);
+  if(!code) return null;                        // not a Brazilian municipality
+  if(ibgeCache[code]) return ibgeCache[code];
+  const name=j.name||(j.address&&(j.address.municipality||j.address.city))||'Municipality';
+  let areaKm2=null,pop=null,popYear=null;
+  try{
+    const md=await (await fetch(`https://servicodados.ibge.gov.br/api/v3/malhas/municipios/${code}/metadados`)).json();
+    areaKm2=parseFloat(md&&md[0]&&md[0].area&&md[0].area.dimensao)||null;
+  }catch(e){}
+  try{
+    const ag=await (await fetch(`https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/2024/variaveis/9324?localidades=N6%5B${code}%5D`)).json();
+    const serie=ag&&ag[0]&&ag[0].resultados&&ag[0].resultados[0].series[0].serie;
+    if(serie&&Object.keys(serie).length){
+      popYear=Object.keys(serie).sort().pop(); pop=+serie[popYear];
+    }
+  }catch(e){}
+  if(!pop&&j.extratags&&j.extratags.population){
+    pop=+j.extratags.population; popYear=null;   // OSM-sourced fallback
+  }
+  const out={code,name,areaKm2,pop,popYear,density:ibgeDensity(pop,areaKm2)};
+  ibgeCache[code]=out;
+  return out;
+}
+async function applyIBGE(){
+  if(!geoCtx) return;
+  const el=$('ibgeInfo');
+  el.textContent='Looking up municipality...';
+  $('g360Link').style.display='none';
+  try{
+    const info=await fetchIBGE(geoCtx.cLat,geoCtx.cLon);
+    if(!info){ el.textContent='IBGE census data covers Brazilian municipalities only.'; return; }
+    el.innerHTML=`<b>${info.name}</b> · IBGE ${info.code}`+
+      (info.pop?` · pop ${info.pop.toLocaleString()}${info.popYear?' ('+info.popYear+' est.)':''}`:'')+
+      (info.areaKm2?` · ${Math.round(info.areaKm2).toLocaleString()} km²`:'')+
+      (info.density?` · ${info.density.toLocaleString()}/km²`:'');
+    log(`IBGE: ${info.name}${info.pop?' - pop '+info.pop.toLocaleString():''}`+
+      `${info.areaKm2?', '+Math.round(info.areaKm2)+' km2':''}`+
+      `${info.density?', '+info.density+'/km2':''}`,'ok');
+    if(info.code==='5208707'){                   // Goiânia: cadastral portal link
+      const a=$('g360Link');
+      a.href=`https://portal-goiania.geo360.com.br/icad/map/${geoCtx.cLon},${geoCtx.cLat},16/list`;
+      a.style.display='block';
+    }
+  }catch(err){ el.textContent='IBGE lookup unavailable: '+err.message; }
+}
+async function toggleIbgeBoundary(){
+  const btn=$('ibgeBtn');
+  if(ibgeBoundary){
+    map.removeLayer(ibgeBoundary); ibgeBoundary=null;
+    btn.textContent='IBGE boundary: OFF'; btn.classList.remove('active-mode');
+    return;
+  }
+  btn.textContent='IBGE boundary: ...';
+  try{
+    const c=map.getCenter();
+    const info=await fetchIBGE(c.lat,c.lng);
+    if(!info) throw new Error('Brazilian municipalities only');
+    const gj=await (await fetch(`https://servicodados.ibge.gov.br/api/v3/malhas/municipios/${info.code}?formato=application/vnd.geo%2Bjson`)).json();
+    ibgeBoundary=L.geoJSON(gj,{style:{color:'#38e1ff',weight:2,dashArray:'6 6',
+      fillColor:'#38e1ff',fillOpacity:0.03}}).addTo(map);
+    btn.textContent='IBGE: '+info.name; btn.classList.add('active-mode');
+    log(`IBGE boundary: ${info.name} (${info.code})`,'ok');
+  }catch(err){
+    btn.textContent='IBGE boundary: OFF';
+    log('IBGE boundary: '+err.message,'err');
+  }
+}
+$('ibgeBtn').addEventListener('click',toggleIbgeBoundary);
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)
@@ -3171,6 +3277,7 @@ $('buildBtn').addEventListener('click',async()=>{
       log(`Night calibration: VIIRS Black Marble x${c.toFixed(2)}`,'ai');
     });
     applyWeatherMode();
+    applyIBGE();
   }catch(err){
     console.error(err);
     log('Build failed: '+err.message,'err');
@@ -3198,6 +3305,7 @@ $('resetBtn').addEventListener('click',()=>{
   removeRain(); weatherState=null; climCache=null; simData=null;
   $('wxMonth').value='live'; $('wxVal').innerHTML='&mdash;'; $('wxInfo').textContent='';
   $('simWrap').style.display='none';
+  $('ibgeInfo').textContent=''; $('g360Link').style.display='none';
   scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;

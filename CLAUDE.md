@@ -152,6 +152,12 @@ No required API keys. All backing services are free/public:
   tiles for the time machine) — public, no key.
 - Open-Meteo (current weather + ERA5 archive back to 1980) — public, no key.
 - RainViewer (live precipitation radar frames) — public, no key.
+- IBGE servicodados API (municipal area, population estimates, boundary
+  GeoJSON) — public, no key, CORS `*`. Municipality resolved from build
+  coordinates via Nominatim reverse + `IBGE:GEOCODIGO` extratag.
+- Goiânia geo360 cadastral portal — data APIs are behind municipal auth
+  (tile gateway returns 401); the app links out to the portal for Goiânia
+  builds instead of consuming it. Do not attempt to bypass its auth.
 - **Mapillary access token** — optional, user-supplied at runtime via the
   "Mapillary token" password input in the UI (for real street-photo facades).
   Never hardcode a token in source; it's a per-session runtime input only.
