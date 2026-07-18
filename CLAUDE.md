@@ -168,6 +168,12 @@ No required API keys. All backing services are free/public:
   overlays on the 2D map: vegetation, soils/pedology, geomorphology, geology
   (`BDIA:vege_area`/`pedo_area`/`geom_area`/`geol_area`, GetMap verified
   live; Brazil coverage only). Select + opacity slider in the map panel.
+  Its GetFeatureInfo works server-side but sends NO CORS headers and JSONP
+  is disabled — live point queries from the browser are impossible. Point
+  readouts ("Geo-datasets here") are therefore precomputed at all 53
+  Brazilian area centres into `atlas_ibge_geosci.js` (20KB,
+  `window.ATLAS_IBGE_GEOSCI`, keyed by area name = `geoCtx.placeName`;
+  `formatGeoSci` pure/tested); non-preset spots get an honest note.
 - Goiânia geo360 cadastral portal — data APIs are behind municipal auth
   (tile gateway returns 401); the app links out to the portal for Goiânia
   builds instead of consuming it. Do not attempt to bypass its auth.

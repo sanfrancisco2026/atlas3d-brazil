@@ -105,5 +105,37 @@ check('missing bundle/state -> null (falls back to API)',
 check('unknown municipality in bundle -> null',
   meshFromBundle(BUNDLE,'municipality','5299999')===null);
 
+function formatGeoSci(e){
+  if(!e) return null;
+  const rows=[];
+  if(e.vege) rows.push(['Vegetation', e.vege.leg||e.vege.sup]);
+  if(e.pedo) rows.push(['Soils', (e.pedo.leg||'')+
+    (e.pedo.ordem&&e.pedo.ordem!=='OUTROS'?' ('+e.pedo.ordem+')':'')]);
+  if(e.geom) rows.push(['Geomorphology',
+    [e.geom.leg,e.geom.comp,e.geom.forma].filter(Boolean).join(' · ')]);
+  if(e.geol) rows.push(['Geology',
+    [e.geol.unit,e.geol.era,e.geol.prov?'Prov. '+e.geol.prov:null].filter(Boolean).join(' · ')]);
+  return rows.filter(r=>r[1]);
+}
+
+console.log('=== formatGeoSci (BDIA readout rows) ===');
+// mirrors the live Goiania GetFeatureInfo responses captured via curl
+const GO={vege:{leg:'3Iu - Influencia urbana',sup:'Savana'},
+  pedo:{leg:'Area Urbana',ordem:'OUTROS'},
+  geom:{leg:'Superficie de Goiania',comp:'Planaltos',forma:'topo tabular'},
+  geol:{unit:'Grupo Araxa - Subunidade B',era:'Proterozoico Neoproterozoica Toniano',prov:'Tocantins'}};
+const rows=formatGeoSci(GO);
+check('four dataset rows for a full entry', rows.length===4);
+check('vegetation prefers legenda over superclass', rows[0][1].includes('Influencia urbana'));
+check('OUTROS soil order suppressed', rows[1][1]==='Area Urbana');
+check('geomorphology joins unit/compartment/form',
+  rows[2][1]==='Superficie de Goiania · Planaltos · topo tabular');
+check('geology carries unit, era and province',
+  rows[3][1].includes('Grupo Araxa')&&rows[3][1].includes('Prov. Tocantins'));
+check('partial entry keeps only present datasets',
+  formatGeoSci({geol:{unit:'X'}}).length===1);
+check('null entry -> null (caller shows the honest note)', formatGeoSci(null)===null);
+check('empty entry -> empty rows', formatGeoSci({}).length===0);
+
 console.log(fail===0?'ALL PASS ('+pass+' checks)':'FAIL ('+fail+')');
 process.exit(fail===0?0:1);

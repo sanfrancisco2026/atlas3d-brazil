@@ -168,6 +168,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <script src="atlas_local_goias.js" defer></script>
 <script src="atlas_local_southafrica.js" defer></script>
 <script src="atlas_ibge_mesh.js" defer></script>
+<script src="atlas_ibge_geosci.js" defer></script>
 <script src="atlas_merge.js" defer></script>
 </head>
 
@@ -366,6 +367,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 
     <div class="slider-row" style="margin-top:12px"><span>Municipality (IBGE)</span><b></b></div>
     <p class="hint" id="ibgeInfo"></p>
+    <div class="slider-row" style="margin-top:10px"><span>Geo-datasets here (IBGE BDIA)</span><b></b></div>
+    <p class="hint" id="geoSciInfo"></p>
     <a id="g360Link" target="_blank" rel="noopener" style="display:none;text-align:center;
       text-decoration:none;padding:9px;border:1px solid #33405a;border-radius:7px;color:#93a3bc;
       font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;margin-top:6px">
@@ -1652,6 +1655,37 @@ async function applyIBGE(){
     }
   }catch(err){ el.textContent='IBGE lookup unavailable: '+err.message; }
 }
+// Pure (unit-tested): compact BDIA bundle entry -> [label, value] rows
+function formatGeoSci(e){
+  if(!e) return null;
+  const rows=[];
+  if(e.vege) rows.push(['Vegetation', e.vege.leg||e.vege.sup]);
+  if(e.pedo) rows.push(['Soils', (e.pedo.leg||'')+
+    (e.pedo.ordem&&e.pedo.ordem!=='OUTROS'?' ('+e.pedo.ordem+')':'')]);
+  if(e.geom) rows.push(['Geomorphology',
+    [e.geom.leg,e.geom.comp,e.geom.forma].filter(Boolean).join(' · ')]);
+  if(e.geol) rows.push(['Geology',
+    [e.geol.unit,e.geol.era,e.geol.prov?'Prov. '+e.geol.prov:null].filter(Boolean).join(' · ')]);
+  return rows.filter(r=>r[1]);
+}
+// Which IBGE geo-dataset units cover the built area. Live GetFeatureInfo
+// is impossible from a browser (no CORS, JSONP off), so readouts are
+// precomputed at every Brazilian offline-area centre into
+// atlas_ibge_geosci.js; anywhere else gets an honest note.
+function applyGeoSciInfo(){
+  const el=$('geoSciInfo'); if(!el||!geoCtx) return;
+  const B=window.ATLAS_IBGE_GEOSCI;
+  const rows=formatGeoSci(B&&B.areas&&B.areas[geoCtx.placeName]);
+  if(rows&&rows.length){
+    el.innerHTML=rows.map(([k,v])=>`<b>${k}:</b> ${v}`).join('<br>');
+    log('IBGE geo-datasets at area centre: '+rows.map(r=>r[0]).join(', ')+' (precomputed BDIA)','ok');
+  }else{
+    el.textContent='Point readout is precomputed for Brazilian preset areas only '+
+      '(IBGE’s GeoServer sends no CORS headers, so live browser queries are blocked). '+
+      'The geoscience overlays on the 2D map still work anywhere in Brazil.';
+  }
+}
+
 // Pure (unit-tested): the UF (state) code is the first two digits of a
 // municipal geocode; Brazilian UFs run 11 (RO) through 53 (DF).
 function ufFromCode(code){
@@ -3379,6 +3413,7 @@ $('buildBtn').addEventListener('click',async()=>{
     });
     applyWeatherMode();
     applyIBGE();
+    applyGeoSciInfo();
   }catch(err){
     console.error(err);
     log('Build failed: '+err.message,'err');
@@ -3407,6 +3442,7 @@ $('resetBtn').addEventListener('click',()=>{
   $('wxMonth').value='live'; $('wxVal').innerHTML='&mdash;'; $('wxInfo').textContent='';
   $('simWrap').style.display='none';
   $('ibgeInfo').textContent=''; $('g360Link').style.display='none';
+  $('geoSciInfo').textContent='';
   scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
