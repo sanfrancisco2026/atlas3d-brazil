@@ -3345,8 +3345,11 @@ function step(id,state){ const el=$(id);
 $('buildBtn').addEventListener('click',async()=>{
   if(appState!=='map') return;
   if(!renderer){
+    const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
     log('Cannot build: the 3D engine never started (WebGL unavailable).','err');
-    log('Close other tabs of this app, fully quit and reopen the browser, then hard-reload (Ctrl+Shift+R).','err');
+    log(`Diagnostics - WebGL2: ${probe('webgl2')?'yes':'NO'} · WebGL1: ${probe('webgl')?'yes':'NO'} · ${navigator.userAgent}`,'err');
+    log('Decisive test: open this page in an INCOGNITO window (extensions off). If it builds there, a privacy/ad-block extension is blocking WebGL on localhost - whitelist it.','err');
+    log('Otherwise: try another browser (e.g. Edge), close other 3D tabs, fully restart the browser.','err');
     return;
   }
   appState='building';
