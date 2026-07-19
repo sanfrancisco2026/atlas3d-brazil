@@ -138,6 +138,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 #bldCard .bc-row b.src-osm{color:var(--success)}
 #bldCard .bc-row b.src-shadow{color:var(--accent)}
 #bldCard .bc-row b.src-typo{color:#a7b4c9}
+#bldCard .bc-row b.src-ms{color:#8fb8ff}
+#bldCard .bc-row b.src-lidar{color:#2fd4c0}
 #bldCard .bc-hint{font-size:.56rem;color:#5d6b83;margin-top:8px;letter-spacing:.5px}
 
 /* zoom controls (3D view) */
@@ -170,6 +172,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <script src="atlas_ibge_mesh.js" defer></script>
 <script src="atlas_ibge_geosci.js" defer></script>
 <script src="atlas_crime_data.js" defer></script>
+<script src="atlas_ms_buildings.js" defer></script>
+<script src="atlas_lidar_sp.js" defer></script>
 <script src="atlas_merge.js" defer></script>
 </head>
 
@@ -347,6 +351,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <label class="small">Crime reports (crimebrasil.com.br sample)</label>
     <div class="btn-row">
       <button id="crimeBtn" class="ghost">Crime layer: OFF</button>
+      <button id="lidarBtn" class="ghost">SP height model: OFF</button>
     </div>
 
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
@@ -719,6 +724,37 @@ async function fetchOSM(b){
 }
 
 /* ---- local Geofabrik dataset (offline, no Overpass needed) ---- */
+// Pure (unit-tested): tags for a Microsoft ML footprint gap-filler.
+// height only when the ML estimate exists (>0) - absent means the
+// normal estimation pipeline (shadow/typology) extrudes it.
+function msFootprintTags(h){
+  const t={building:'yes','ms:footprint':'1'};
+  if(h>0) t.height=String(h);
+  return t;
+}
+/* ---- Sao Paulo LiDAR height model (PMSP 2017, AWS Open Data) ----
+   4m uint8 grid of heights above ground per SP preset area. Buildings
+   without an OSM height sample it at their centroid (3x3 max) and get
+   measured heights; the grid also renders as a 2D-map overlay. */
+function lidarAreaFor(lat,lon){
+  const L=window.ATLAS_LIDAR; if(!L||!L.areas) return null;
+  for(const a of Object.values(L.areas))
+    if(lat>=a.S&&lat<=a.N&&lon>=a.W&&lon<=a.E) return a;
+  return null;
+}
+// Pure (unit-tested): grid sample, max of the 3x3 neighbourhood, metres.
+// Row 0 of the grid is the SOUTH edge (generator convention).
+function lidarHeightAt(a,lat,lon,decode){
+  if(!a._u8) a._u8=(decode||(s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0))))(a.heights);
+  const gx=Math.floor((lon-a.W)/(a.E-a.W)*a.w);
+  const gy=Math.floor((lat-a.S)/(a.N-a.S)*a.h);
+  let m=0;
+  for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+    const x=gx+dx,y=gy+dy;
+    if(x>=0&&y>=0&&x<a.w&&y<a.h) m=Math.max(m,a._u8[y*a.w+x]);
+  }
+  return m;
+}
 function localOSM(b){
   if(!window.ATLAS_LOCAL||!window.ATLAS_LOCAL.areas) return null;
   const a=window.ATLAS_LOCAL.areas.find(a=>b.S>=a.S&&b.N<=a.N&&b.W>=a.W&&b.E<=a.E);
@@ -729,13 +765,38 @@ function localOSM(b){
   const addNode=(lat,lon,tags)=>{
     const n={type:'node',id:nid++,lat,lon}; if(tags)n.tags=tags;
     data.nodesById[n.id]=n; data.elements.push(n); return n.id; };
+  // LiDAR height model covering this zone (SP areas): measured heights for
+  // any footprint that doesn't carry an OSM height tag.
+  const lidar=lidarAreaFor((b.S+b.N)/2,(b.W+b.E)/2);
+  let lidarCount=0;
+  const applyLidar=(w,ring)=>{
+    if(!lidar||w.tags.height) return;
+    let sl=0,sn=0; ring.forEach(([la,lo])=>{ sl+=la; sn+=lo; });
+    const h=lidarHeightAt(lidar,sl/ring.length,sn/ring.length);
+    if(h>=3){ w.tags.height=String(h); w.tags['lidar:height']='1'; lidarCount++; }
+  };
   a.b.forEach(([typ,ring,syn])=>{
     if(!inBox(ring)) return;
     const w={type:'way',id:wid++,nodes:ring.map(([lat,lon])=>addNode(lat,lon)),
       tags:{building:typ||'yes'}};
     if(syn) w.tags['atlas:synthetic']='1';
+    else applyLidar(w,ring);
     data.waysById[w.id]=w; data.elements.push(w);
   });
+  // Microsoft ML footprints: standardized polygons filling gaps where OSM
+  // has no building (deduped offline). ML height rides along when known;
+  // unknown heights fall through to the shadow/typology extrusion pipeline.
+  const ms=window.ATLAS_MS_BUILDINGS&&window.ATLAS_MS_BUILDINGS.areas
+    &&window.ATLAS_MS_BUILDINGS.areas[a.name];
+  let msCount=0;
+  if(ms) ms.forEach(([h,ring])=>{
+    if(!inBox(ring)) return;
+    const w={type:'way',id:wid++,nodes:ring.map(([lat,lon])=>addNode(lat,lon)),
+      tags:msFootprintTags(h)};
+    applyLidar(w,ring);
+    data.waysById[w.id]=w; data.elements.push(w); msCount++;
+  });
+  data.msCount=msCount; data.lidarCount=lidarCount;
   a.r.forEach(([fc,pts])=>{
     if(!inBox(pts)) return;
     const w={type:'way',id:wid++,nodes:pts.map(([lat,lon])=>addNode(lat,lon)),
@@ -1270,7 +1331,8 @@ function buildBuildings(osm){
     mesh.castShadow=true; mesh.receiveShadow=true;
     mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
       area:Math.round(p.area),
-      src:p.tagged?'osm':(p.shadow?'shadow':'typo')};   // height provenance
+      src:p.tagged?(p.tags['lidar:height']?'lidar':(p.tags['ms:footprint']?'ms':'osm'))
+         :(p.shadow?'shadow':'typo')};   // height provenance
 
     // industrial sources feed the air-quality estimator + smoke plumes
     const btype=(p.tags.building||'').toLowerCase();
@@ -1849,6 +1911,50 @@ function toggleCrime(){
   log('Crime data note: '+C.note,'ai');
 }
 $('crimeBtn').addEventListener('click',toggleCrime);
+
+/* ---- Sao Paulo LiDAR height-model overlay (2D map) ----
+   Renders each bundled 4m height grid as a colour-ramped image overlay:
+   transparent ground, green->yellow low-rise, orange mid, red/magenta
+   high-rise. Same data that feeds measured 3D heights in SP builds. */
+function lidarColor(h){          // pure-testable ramp: h metres -> [r,g,b,a]
+  if(h<3) return [0,0,0,0];
+  if(h<10) return [80+h*8,200,90,150];
+  if(h<30) return [235,160-(h-10)*3,60,165];
+  if(h<80) return [235,60,90+(h-30)*2,180];
+  return [255,80,220,200];
+}
+let lidarOverlay=null;
+function toggleLidarOverlay(){
+  const btn=$('lidarBtn');
+  if(lidarOverlay){
+    lidarOverlay.forEach(o=>map.removeLayer(o)); lidarOverlay=null;
+    btn.textContent='SP height model: OFF'; btn.classList.remove('active-mode');
+    return;
+  }
+  const L2=window.ATLAS_LIDAR;
+  if(!L2||!L2.areas||!Object.keys(L2.areas).length){
+    log('SP height model: bundle missing','err'); return;
+  }
+  lidarOverlay=Object.values(L2.areas).map(a=>{
+    if(!a._u8) a._u8=Uint8Array.from(atob(a.heights),c=>c.charCodeAt(0));
+    const c=document.createElement('canvas'); c.width=a.w; c.height=a.h;
+    const ctx=c.getContext('2d'); const img=ctx.createImageData(a.w,a.h);
+    for(let y=0;y<a.h;y++)for(let x=0;x<a.w;x++){
+      const v=a._u8[(a.h-1-y)*a.w+x];       // grid row 0 = south; canvas row 0 = north
+      const [r,g,bb,al]=lidarColor(v);
+      const i=(y*a.w+x)*4;
+      img.data[i]=r; img.data[i+1]=g; img.data[i+2]=bb; img.data[i+3]=al;
+    }
+    ctx.putImageData(img,0,0);
+    return L.imageOverlay(c.toDataURL(),[[a.S,a.W],[a.N,a.E]],
+      {opacity:.75,attribution:'Height model: PMSP 2017 LiDAR (AWS Open Data)'}).addTo(map);
+  });
+  const first=Object.values(L2.areas)[0];
+  map.setView([(first.S+first.N)/2,(first.W+first.E)/2],14);
+  btn.textContent='SP height model: ON'; btn.classList.add('active-mode');
+  log('SP height model: PMSP 2017 LiDAR, 4m grid, '+lidarOverlay.length+' area(s) - Sao Paulo coverage only','ok');
+}
+$('lidarBtn').addEventListener('click',toggleLidarOverlay);
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)
@@ -2440,7 +2546,8 @@ function onCanvasClick(e){
 
 /* ---- building inspect card ---- */
 const SRC_LABEL={osm:['OSM z-tag','src-osm'],shadow:['shadow-measured','src-shadow'],
-  typo:['typology estimate','src-typo']};
+  typo:['typology estimate','src-typo'],ms:['Microsoft ML height','src-ms'],
+  lidar:['LiDAR 2017 (PMSP)','src-lidar']};
 let selEdges=null;
 function selectBuilding(mesh,cx,cy){
   hideBldCard();
@@ -3424,6 +3531,10 @@ $('buildBtn').addEventListener('click',async()=>{
 
     const local=localOSM(b);
     if(local) log('OFFLINE MODE: local Geofabrik dataset - '+local.name,'ok');
+    if(local&&local.data.msCount)
+      log(`+ ${local.data.msCount} Microsoft ML footprints (gap fill, ODbL)`,'ai');
+    if(local&&local.data.lidarCount)
+      log(`+ ${local.data.lidarCount} LiDAR-measured heights (PMSP 2017)`,'ai');
     geoCtx.placeName=(local&&local.name)||$('searchInput').value.trim()
       ||`${b.cLat.toFixed(4)}, ${b.cLon.toFixed(4)}`;
     const [osm,sat]=await Promise.all([
