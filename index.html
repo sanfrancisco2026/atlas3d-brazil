@@ -169,6 +169,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <script src="atlas_local_southafrica.js" defer></script>
 <script src="atlas_ibge_mesh.js" defer></script>
 <script src="atlas_ibge_geosci.js" defer></script>
+<script src="atlas_crime_data.js" defer></script>
 <script src="atlas_merge.js" defer></script>
 </head>
 
@@ -333,6 +334,11 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <div class="slider-row"><span>Geoscience opacity</span><b id="geoSciOpVal">60%</b></div>
     <input type="range" id="geoSciOp" min="10" max="100" step="5" value="60">
 
+    <label class="small">Crime reports (crimebrasil.com.br sample)</label>
+    <div class="btn-row">
+      <button id="crimeBtn" class="ghost">Crime layer: OFF</button>
+    </div>
+
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
       is the area that will be reconstructed from OpenStreetMap footprints + Esri satellite imagery.</p>
@@ -440,7 +446,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Solar roof (est.)</span><b id="bcSolar">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
-<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE</div>
+<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE &middot; Crime sample: crimebrasil.com.br</div>
 
 <!-- ================= LOADER ================= -->
 <div id="loader">
@@ -1790,6 +1796,49 @@ $('geoSciOp').addEventListener('input',()=>{
   $('geoSciOpVal').textContent=$('geoSciOp').value+'%';
   if(geoSciObj) geoSciObj.setOpacity(+$('geoSciOp').value/100);
 });
+
+/* ---- crime reports layer (crimebrasil.com.br public API sample) ----
+   The source's per-incident coordinates are placeholders and its API
+   ignores spatial filters (both verified), so records are aggregated
+   per municipality offline and placed at IBGE municipality centroids.
+   Bubble size = record count in the sample; popup carries the top
+   crime groups and years. The sample is Tocantins-dominated - this
+   is NOT nationwide coverage, and the log says so. */
+// Pure (unit-tested): bubble radius px, sqrt scale, clamped
+function crimeRadius(total,max){
+  return clamp(6+22*Math.sqrt(total/Math.max(1,max)),6,28);
+}
+// Pure (unit-tested): popup HTML for one municipality entry
+function crimePopup(m){
+  const top=(m.top||[]).map(([g,n])=>`${g}: ${n}`).join('<br>');
+  const yrs=Object.keys(m.years||{}).sort().join(', ');
+  return `<b>${m.name}</b><br>${m.total} record${m.total===1?'':'s'} in sample`+
+    (top?`<hr style="margin:4px 0">${top}`:'')+
+    (yrs?`<br><i>years: ${yrs}</i>`:'');
+}
+let crimeLayer=null;
+function toggleCrime(){
+  const btn=$('crimeBtn');
+  if(crimeLayer){
+    map.removeLayer(crimeLayer); crimeLayer=null;
+    btn.textContent='Crime layer: OFF'; btn.classList.remove('active-mode');
+    return;
+  }
+  const C=window.ATLAS_CRIME;
+  if(!C||!C.municipalities||!C.municipalities.length){
+    log('Crime layer: bundled dataset missing','err'); return;
+  }
+  const max=C.municipalities[0].total;
+  crimeLayer=L.layerGroup(C.municipalities.map(m=>
+    L.circleMarker([m.lat,m.lon],{radius:crimeRadius(m.total,max),
+      color:'#ff4d5e',weight:1.5,fillColor:'#ff4d5e',fillOpacity:.25})
+      .bindPopup(crimePopup(m)))).addTo(map);
+  btn.textContent=`Crime layer: ${C.municipalities.length} municipalities`;
+  btn.classList.add('active-mode');
+  log(`Crime layer: ${C.sampleSize} sampled records across ${C.municipalities.length} municipalities`,'ok');
+  log('Crime data note: '+C.note,'ai');
+}
+$('crimeBtn').addEventListener('click',toggleCrime);
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)

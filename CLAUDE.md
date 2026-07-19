@@ -174,6 +174,13 @@ No required API keys. All backing services are free/public:
   Brazilian area centres into `atlas_ibge_geosci.js` (20KB,
   `window.ATLAS_IBGE_GEOSCI`, keyed by area name = `geoCtx.placeName`;
   `formatGeoSci` pure/tested); non-preset spots get an honest note.
+- crimebrasil.com.br `/api/crimes` — public JSON API (robots-allowed), but
+  per-incident lat/lons are placeholders, spatial filters are ignored, no
+  CORS, and coverage is Tocantins-dominated (~2020). Integrated as
+  `atlas_crime_data.js`: offline aggregation per municipality (3,649-record
+  sample, 363 municipalities) geo-referenced to IBGE mesh centroids, rendered
+  as a bubble layer toggle on the 2D map (`crimeRadius`/`crimePopup` pure,
+  tested). Do NOT present this as nationwide or per-incident data.
 - Goiânia geo360 cadastral portal — data APIs are behind municipal auth
   (tile gateway returns 401); the app links out to the portal for Goiânia
   builds instead of consuming it. Do not attempt to bypass its auth.
