@@ -323,13 +323,23 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="ibgeBtn" class="ghost">IBGE mesh: OFF</button>
     </div>
 
-    <label class="small">IBGE geoscience overlay (Brazil)</label>
+    <label class="small">Official geo overlays (IBGE &middot; dados.gov.br)</label>
     <select id="geoSciLayer">
       <option value="" selected>&mdash; none &mdash;</option>
-      <option value="BDIA:vege_area">Vegetation</option>
-      <option value="BDIA:pedo_area">Soils / pedology</option>
-      <option value="BDIA:geom_area">Geomorphology / relief</option>
-      <option value="BDIA:geol_area">Geology</option>
+      <optgroup label="Geosciences (BDIA)">
+        <option value="BDIA:vege_area">Vegetation</option>
+        <option value="BDIA:pedo_area">Soils / pedology</option>
+        <option value="BDIA:geom_area">Geomorphology / relief</option>
+        <option value="BDIA:geol_area">Geology</option>
+      </optgroup>
+      <optgroup label="Transport (BC250 2023)">
+        <option value="CCAR:BC250_2023_Trecho_Rodoviario_L">Federal &amp; state highways</option>
+        <option value="CCAR:BC250_2023_Trecho_Ferroviario_L">Railways</option>
+      </optgroup>
+      <optgroup label="Environment &amp; land">
+        <option value="CCAR:BC250_2019_Unidade_Protecao_Integral_A">Protected areas (2019)</option>
+        <option value="CCAR:BC250_2023_Massa_Dagua_A">Water bodies</option>
+      </optgroup>
     </select>
     <div class="slider-row"><span>Geoscience opacity</span><b id="geoSciOpVal">60%</b></div>
     <input type="range" id="geoSciOp" min="10" max="100" step="5" value="60">
@@ -1788,8 +1798,8 @@ function setGeoSci(){
   geoSciObj=L.tileLayer.wms('https://geoservicos.ibge.gov.br/geoserver/wms',{
     layers:name,format:'image/png',transparent:true,version:'1.1.1',
     opacity:+$('geoSciOp').value/100,
-    attribution:'Geosciences: IBGE BDIA'}).addTo(map);
-  log('IBGE geoscience overlay: '+$('geoSciLayer').selectedOptions[0].textContent+' (Brazil coverage)','ok');
+    attribution:'IBGE geoservices (dados.gov.br)'}).addTo(map);
+  log('Official overlay: '+$('geoSciLayer').selectedOptions[0].textContent+' (IBGE, Brazil coverage)','ok');
 }
 $('geoSciLayer').addEventListener('change',setGeoSci);
 $('geoSciOp').addEventListener('input',()=>{

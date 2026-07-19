@@ -168,6 +168,14 @@ No required API keys. All backing services are free/public:
   overlays on the 2D map: vegetation, soils/pedology, geomorphology, geology
   (`BDIA:vege_area`/`pedo_area`/`geom_area`/`geol_area`, GetMap verified
   live; Brazil coverage only). Select + opacity slider in the map panel.
+  The overlay select also carries dados.gov.br-indexed administrative layers
+  from the same server (all GetMap-verified): transport
+  (`CCAR:BC250_2023_Trecho_Rodoviario_L`/`Ferroviario_L`) and environment/land
+  (`CCAR:BC250_2019_Unidade_Protecao_Integral_A` — 2021/2023 vintages error —
+  and `CCAR:BC250_2023_Massa_Dagua_A`). Probed but NOT shipped: dados.gov.br
+  catalog API (401, needs gov.br key), dados.mj SINESP (503 maintenance),
+  DNIT ArcGIS (unreachable), IPEA odata HOMIC (0 rows/400s), INPE queimadas
+  WMS (catalog OK, GetMap times out) — recheck INPE for a live-fires layer.
   Its GetFeatureInfo works server-side but sends NO CORS headers and JSONP
   is disabled — live point queries from the browser are impossible. Point
   readouts ("Geo-datasets here") are therefore precomputed at all 53
