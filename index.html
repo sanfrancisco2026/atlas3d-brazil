@@ -938,6 +938,25 @@ function fmtKwp(kwp){
 /* ============================================================
    THREE.JS CORE
 ============================================================ */
+/* ---- graphics tiering: adapt rendering cost to the actual GPU ----
+   The browser may run on the discrete GPU, the integrated one, or a
+   software rasterizer (this machine has both an RTX 2050 and an Iris
+   Xe - Chromium often picks the iGPU). Tier drives pixel ratio,
+   shadow-map size, bloom resolution, rain and traffic budgets. */
+let gfxTier='high', gfxPixelRatio=2, gfxGpuName='unknown';
+// Pure (unit-tested): renderer string -> tier
+function classifyGPU(s){
+  s=(s||'').toLowerCase();
+  if(/swiftshader|software|llvmpipe|basic render/.test(s)) return 'low';
+  if(/intel|iris|uhd graphics/.test(s)) return 'medium';
+  if(/nvidia|geforce|rtx|gtx|radeon|apple m\d/.test(s)) return 'high';
+  return 'medium';
+}
+const GFX={
+  high:  {px:2,   shadow:4096, bloomDiv:1, rain:1,   traffic:190},
+  medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150},
+  low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90},
+};
 function createRenderer(){
   // Try progressively humbler context profiles: machines whose discrete
   // GPU / driver refuses a high-performance antialiased context often
@@ -951,10 +970,12 @@ function createRenderer(){
       'Graphics fallback: reduced/software rendering mode - expect low FPS'],
   ];
   let lastErr;
-  for(const [opts,note] of profiles){
+  for(let i=0;i<profiles.length;i++){
+    const [opts,note]=profiles[i];
     try{
       const r=new THREE.WebGLRenderer(opts);
       if(note) log(note,'ai');
+      if(i>0) gfxTier='low';            // needed a fallback profile: be gentle
       return r;
     }catch(e){ lastErr=e; }
   }
@@ -981,9 +1002,21 @@ function createRenderer(){
 }
 function initThree(){
   renderer=createRenderer();
-  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  // classify the ACTUAL gpu the browser chose and budget accordingly
+  try{
+    const gl=renderer.getContext();
+    const ext=gl.getExtension('WEBGL_debug_renderer_info');
+    gfxGpuName=ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):'unknown';
+    if(gfxTier!=='low') gfxTier=classifyGPU(gfxGpuName);
+  }catch(e){}
+  const G=GFX[gfxTier];
+  gfxPixelRatio=Math.min(devicePixelRatio,G.px);
+  log(`Graphics tier: ${gfxTier} (${gfxGpuName}) - `+
+    `${G.shadow?G.shadow+'px shadows':'shadows off'}, ${gfxPixelRatio.toFixed(1)}x pixels, `+
+    `bloom 1/${G.bloomDiv}`,'ai');
+  renderer.setPixelRatio(gfxPixelRatio);
   renderer.setSize(innerWidth,innerHeight);
-  renderer.shadowMap.enabled=true;
+  renderer.shadowMap.enabled=G.shadow>0;
   renderer.shadowMap.type=THREE.PCFSoftShadowMap;
   renderer.toneMapping=THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure=0.55;
@@ -1012,7 +1045,7 @@ function initThree(){
   sunVec=new THREE.Vector3();
   dirLight=new THREE.DirectionalLight(0xffffff,2.6);
   dirLight.castShadow=true;
-  dirLight.shadow.mapSize.set(4096,4096);
+  dirLight.shadow.mapSize.set(GFX[gfxTier].shadow||1024,GFX[gfxTier].shadow||1024);
   dirLight.shadow.camera.left=-900; dirLight.shadow.camera.right=900;
   dirLight.shadow.camera.top=900; dirLight.shadow.camera.bottom=-900;
   dirLight.shadow.camera.far=6000; dirLight.shadow.bias=-0.0002;
@@ -1034,7 +1067,8 @@ function initThree(){
   // post-processing
   composer=new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene,camera));
-  bloomPass=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.3,0.35,0.78);
+  const bd=GFX[gfxTier].bloomDiv;
+  bloomPass=new UnrealBloomPass(new THREE.Vector2(innerWidth/bd,innerHeight/bd),0.3,0.35,0.78);
   composer.addPass(bloomPass);
   composer.addPass(new OutputPass());
 
@@ -1632,7 +1666,7 @@ function buildTraffic(){
   removeTraffic();
   if(!trafficPaths.length) return;
   const majors=trafficPaths.filter(p=>p.major);
-  const N=Math.min(190,trafficPaths.length*3);
+  const N=Math.min(GFX[gfxTier].traffic,trafficPaths.length*3);
   const col=new THREE.Color();
   VEH_TYPES.forEach((t,ti)=>{
     const pool=t.majorOnly?majors:trafficPaths;
@@ -2054,7 +2088,7 @@ function downloadBlob(name,blob){
   setTimeout(()=>URL.revokeObjectURL(a.href),5000);
 }
 function restoreRenderSize(){
-  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setPixelRatio(gfxPixelRatio);
   renderer.setSize(innerWidth,innerHeight,false);
   composer.setSize(innerWidth,innerHeight);
 }
@@ -2287,7 +2321,7 @@ function removeRain(){
 function buildRain(intensity){
   removeRain();
   if(intensity<=0.02) return;
-  const N=Math.round(600+2400*intensity);
+  const N=Math.round((600+2400*intensity)*GFX[gfxTier].rain);
   const W=geoCtx?geoCtx.sceneW:800, H=260;
   const pos=new Float32Array(N*3), spd=new Float32Array(N);
   for(let i=0;i<N;i++){
