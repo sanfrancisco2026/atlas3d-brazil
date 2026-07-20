@@ -1148,9 +1148,12 @@ function buildSharedMaterials(){
     emissiveIntensity:0.05,roughness:.9,transparent:true,opacity:.92,side:THREE.DoubleSide});
   matRoadMinor=new THREE.MeshStandardMaterial({color:0x14161c,emissive:0xffc36b,
     emissiveIntensity:0.03,roughness:.9,transparent:true,opacity:.85,side:THREE.DoubleSide});
-  // white base colour so per-instance paint colours (setColorAt) show true
+  // white base colour so per-instance paint colours (setColorAt) show true.
+  // DoubleSide: decimated GLB shells are thin single-surface meshes - front-
+  // face culling made bus interiors visible ("hollow" look).
   vehMats=VEH_TYPES.map(()=>new THREE.MeshStandardMaterial({color:0xffffff,
-    metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35}));
+    metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35,
+    side:THREE.DoubleSide}));
   wheelMat=new THREE.MeshStandardMaterial({color:0x17181c,roughness:.92,metalness:.1});
   matCar=vehMats[0];
 }
@@ -1651,6 +1654,7 @@ function vehicleGeometry(t){
     g.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry; });
     if(!geo) return;
     if(!geo.attributes.normal) geo.computeVertexNormals();
+    if(key==='truck') geo.rotateY(Math.PI);   // source mesh faces -Z (drove backwards)
     vehModelGeos[key]=geo;
     log(`Traffic: GLB ${key} model active`,'ai');
     if(appState==='city'&&trafficPaths.length) buildTraffic();   // hot-swap
