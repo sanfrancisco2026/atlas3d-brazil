@@ -354,6 +354,16 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="lidarBtn" class="ghost">SP height model: OFF</button>
     </div>
 
+    <label class="small">dados.gov.br catalog (requires your API key)</label>
+    <input id="dgKey" type="password" placeholder="chave-api-dados-abertos (from your gov.br account)"
+      style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:8px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
+    <div style="display:flex;gap:8px;margin-top:6px">
+      <input id="dgQuery" type="text" placeholder="transporte, seguran&ccedil;a, meio ambiente..."
+        style="flex:1;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:8px;border-radius:7px;font-size:.72rem;outline:none">
+      <button id="dgBtn" class="ghost" style="width:auto;padding:8px 14px;margin:0">Search</button>
+    </div>
+    <div id="dgResults" style="font-size:.68rem;color:#93a3bc;margin-top:6px;max-height:150px;overflow-y:auto"></div>
+
     <button id="buildBtn" class="primary" style="margin-top:16px">&#9650; Build Immersive 3D</button>
     <p class="hint">Search, pick a preset, or simply <b>click / drag the map</b> &mdash; the golden frame
       is the area that will be reconstructed from OpenStreetMap footprints + Esri satellite imagery.</p>
@@ -1955,6 +1965,44 @@ function toggleLidarOverlay(){
   log('SP height model: PMSP 2017 LiDAR, 4m grid, '+lidarOverlay.length+' area(s) - Sao Paulo coverage only','ok');
 }
 $('lidarBtn').addEventListener('click',toggleLidarOverlay);
+
+/* ---- dados.gov.br catalog search ----
+   Every portal endpoint requires the user's own API key (verified
+   against the OpenAPI spec: apiKey header chave-api-dados-abertos,
+   all operations secured). The key is typed into the password field
+   and used directly from THIS browser - never stored in source.
+   Search params follow the documented GET /publico/conjuntos-dados. */
+async function dgSearch(){
+  const key=$('dgKey').value.trim(), q=$('dgQuery').value.trim();
+  const out=$('dgResults');
+  if(!key){ out.textContent='Paste your dados.gov.br API key first (gov.br account → Minha conta → Chave de API). It stays in your browser.'; return; }
+  if(!q){ out.textContent='Type a search term, e.g. transporte, segurança pública, meio ambiente.'; return; }
+  out.textContent='Searching...';
+  try{
+    const r=await fetch('https://dados.gov.br/dados/api/publico/conjuntos-dados'+
+      `?nomeConjuntoDados=${encodeURIComponent(q)}&pagina=1`,
+      {headers:{'chave-api-dados-abertos':key,'Accept':'application/json'}});
+    if(!r.ok) throw new Error('HTTP '+r.status+(r.status===401?' (invalid/expired key?)':''));
+    const j=await r.json();
+    const items=(Array.isArray(j)?j:(j.conjuntosDados||j.content||[])).slice(0,10);
+    if(!items.length){ out.textContent='No datasets matched "'+q+'".'; return; }
+    out.innerHTML=items.map(d=>{
+      const id=d.id||d.idConjuntoDados||'';
+      const t=d.title||d.nome||d.nomeConjuntoDados||('dataset '+id);
+      const org=(d.organization&&d.organization.title)||d.nomeOrganizacao||'';
+      return `<div style="padding:3px 0;border-bottom:1px solid #16203a">`+
+        `<a target="_blank" rel="noopener" style="color:#4facfe;text-decoration:none" `+
+        `href="https://dados.gov.br/dados/conjuntos-dados/${encodeURIComponent(id)}">${t}</a>`+
+        `${org?' · '+org:''}</div>`;
+    }).join('');
+    log(`dados.gov.br: ${items.length} dataset(s) for "${q}"`,'ok');
+  }catch(err){
+    out.textContent='Catalog error: '+err.message+'. If your key is valid and this persists, '+
+      'the portal may not allow browser calls (CORS) - open dados.gov.br directly.';
+  }
+}
+$('dgBtn').addEventListener('click',dgSearch);
+$('dgQuery').addEventListener('keydown',e=>{ if(e.key==='Enter') dgSearch(); });
 
 /* ============================================================
    EXPORT & SHARE (postcard PNG + GLB 3D model)
