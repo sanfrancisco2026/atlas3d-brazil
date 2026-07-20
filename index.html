@@ -1603,20 +1603,25 @@ function vehicleGeometry(t){
   // two material groups: 0 = painted body, 1 = dark rubber wheels
   return mergeGeometries([body,mergeGeometries(wg)],true);
 }
-// Real vehicle models (decimated offline from Vivekkk-1/3D-Models,
-// BSL-1.0; preprocessed to ~6k faces, length along Z, base at y=0).
-// The repo only publishes cars, so other classes keep box silhouettes;
-// any load failure falls back to boxes too.
-new GLTFLoader().load('models/car.glb',g=>{
-  let geo=null;
-  g.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry; });
-  if(geo){
+// Real vehicle models, decimated offline (length along Z, base y=0,
+// metre scale, materials stripped so per-instance paint applies):
+// car from Vivekkk-1/3D-Models (BSL-1.0); van/bus/truck from
+// user-supplied GLBs. Motorcycles stay boxes (no model provided).
+// Any load failure falls back to that class's box silhouette.
+(()=>{
+  const loader=new GLTFLoader();
+  [['car','models/car.glb'],['van','models/van.glb'],
+   ['bus','models/bus.glb'],['truck','models/truck.glb']]
+  .forEach(([key,url])=>loader.load(url,g=>{
+    let geo=null;
+    g.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry; });
+    if(!geo) return;
     if(!geo.attributes.normal) geo.computeVertexNormals();
-    vehModelGeos.car=geo;
-    log('Traffic: low-poly GLB car model active (Vivekkk-1/3D-Models, BSL-1.0)','ai');
-    if(appState==='city'&&trafficPaths.length) buildTraffic();  // hot-swap
-  }
-},undefined,()=>log('GLB car model unavailable - box fleet fallback','ai'));
+    vehModelGeos[key]=geo;
+    log(`Traffic: GLB ${key} model active`,'ai');
+    if(appState==='city'&&trafficPaths.length) buildTraffic();   // hot-swap
+  },undefined,()=>log(`GLB ${key} model unavailable - box fallback`,'ai')));
+})();
 
 function removeTraffic(){
   trafficMeshes.forEach(m=>{ scene.remove(m);

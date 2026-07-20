@@ -77,12 +77,19 @@ two offline data files. There is no server, no package.json, no bundler — open
    bodies + cylinder wheels in a second dark material group, per-instance
    paint, heavy vehicles on major roads only) with right-hand lane discipline
    via `laneOffset` (pure, tested in `test/traffic_lane.test.js`). The car
-   class uses `models/car.glb` when it loads — a BMW model from
-   github.com/Vivekkk-1/3D-Models (BSL-1.0) decimated offline 66.7k→6k faces,
-   normalized (length along Z, base y=0, 4.6m), materials stripped so
-   per-instance paint applies. That repo has cars only, so other classes stay
-   boxes; load failure also falls back to boxes. GLB geometry is shared
-   across rebuilds (`userData.sharedGeo` skips disposal).
+   car/van/bus/truck classes use real GLB meshes from `models/` when they
+   load (motos stay boxes; any load failure falls back to that class's box).
+   All were decimated/normalized offline (length along Z, base y=0, metre
+   scale, materials stripped so per-instance paint applies): car = BMW from
+   github.com/Vivekkk-1/3D-Models (BSL-1.0, 66.7k→6k faces); van = VW van
+   (347k→17k), bus = Isuzu Erga (3.4k), truck = Saia semi+trailer
+   (1.97M→56k, 23k components filtered to 132) — the last three from
+   user-supplied GLBs (Desktop/3D files; provenance/attribution is the
+   user's to track if ever distributed). Decimation pipeline:
+   scratchpad gen `decimate_fleet.py` pattern — weld+simplify rounds, tiny-
+   component shedding, memory-safe pre-reduction for >250k-face inputs.
+   GLB geometry is shared across rebuilds (`userData.sharedGeo` skips
+   disposal).
 10b. Named roads get flat street-name labels on the road surface
    (`buildRoadLabels`; `dedupeRoadNames`/`labelYaw` pure, tested in
    `test/road_labels.test.js`). Offline builds fetch names via a light async
