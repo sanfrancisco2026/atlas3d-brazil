@@ -496,6 +496,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 /* ============================================================
    GLOBALS
@@ -509,7 +510,7 @@ let geoCtx = null;              // {cLat,cLon,mPerLon,W,E,S,N,sceneW,sceneH}
 let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
-let trafficPaths = [], cars = [], trafficMeshes = [];
+let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {};
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
@@ -1602,8 +1603,24 @@ function vehicleGeometry(t){
   // two material groups: 0 = painted body, 1 = dark rubber wheels
   return mergeGeometries([body,mergeGeometries(wg)],true);
 }
+// Real vehicle models (decimated offline from Vivekkk-1/3D-Models,
+// BSL-1.0; preprocessed to ~6k faces, length along Z, base at y=0).
+// The repo only publishes cars, so other classes keep box silhouettes;
+// any load failure falls back to boxes too.
+new GLTFLoader().load('models/car.glb',g=>{
+  let geo=null;
+  g.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry; });
+  if(geo){
+    if(!geo.attributes.normal) geo.computeVertexNormals();
+    vehModelGeos.car=geo;
+    log('Traffic: low-poly GLB car model active (Vivekkk-1/3D-Models, BSL-1.0)','ai');
+    if(appState==='city'&&trafficPaths.length) buildTraffic();  // hot-swap
+  }
+},undefined,()=>log('GLB car model unavailable - box fleet fallback','ai'));
+
 function removeTraffic(){
-  trafficMeshes.forEach(m=>{ scene.remove(m); m.geometry.dispose(); });
+  trafficMeshes.forEach(m=>{ scene.remove(m);
+    if(!m.userData.sharedGeo) m.geometry.dispose(); });   // GLB geometry is reused
   trafficMeshes=[]; trafficMesh=null; cars=[];
 }
 function buildTraffic(){
@@ -1616,7 +1633,11 @@ function buildTraffic(){
     const pool=t.majorOnly?majors:trafficPaths;
     if(!pool.length) return;
     const n=Math.max(1,Math.round(N*t.share));
-    const mesh=new THREE.InstancedMesh(vehicleGeometry(t),[vehMats[ti],wheelMat],n);
+    const modelGeo=vehModelGeos[t.key];
+    const mesh=modelGeo
+      ? new THREE.InstancedMesh(modelGeo,vehMats[ti],n)          // GLB: one material, painted per instance
+      : new THREE.InstancedMesh(vehicleGeometry(t),[vehMats[ti],wheelMat],n);
+    mesh.userData.sharedGeo=!!modelGeo;
     mesh.castShadow=true;
     for(let i=0;i<n;i++){
       const p=pool[Math.floor(Math.random()*pool.length)];

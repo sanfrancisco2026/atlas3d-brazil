@@ -76,7 +76,13 @@ two offline data files. There is no server, no package.json, no bundler — open
 10. Traffic is a five-class fleet (cars/motos/vans/buses/trucks — multi-box
    bodies + cylinder wheels in a second dark material group, per-instance
    paint, heavy vehicles on major roads only) with right-hand lane discipline
-   via `laneOffset` (pure, tested in `test/traffic_lane.test.js`).
+   via `laneOffset` (pure, tested in `test/traffic_lane.test.js`). The car
+   class uses `models/car.glb` when it loads — a BMW model from
+   github.com/Vivekkk-1/3D-Models (BSL-1.0) decimated offline 66.7k→6k faces,
+   normalized (length along Z, base y=0, 4.6m), materials stripped so
+   per-instance paint applies. That repo has cars only, so other classes stay
+   boxes; load failure also falls back to boxes. GLB geometry is shared
+   across rebuilds (`userData.sharedGeo` skips disposal).
 10b. Named roads get flat street-name labels on the road surface
    (`buildRoadLabels`; `dedupeRoadNames`/`labelYaw` pure, tested in
    `test/road_labels.test.js`). Offline builds fetch names via a light async
