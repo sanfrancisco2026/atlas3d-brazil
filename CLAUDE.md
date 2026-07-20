@@ -189,6 +189,13 @@ No required API keys. All backing services are free/public:
   sample, 363 municipalities) geo-referenced to IBGE mesh centroids, rendered
   as a bubble layer toggle on the 2D map (`crimeRadius`/`crimePopup` pure,
   tested). Do NOT present this as nationwide or per-incident data.
+- dados.gov.br — OpenAPI spec at /v3/api-docs: ALL endpoints secured by the
+  `chave-api-dados-abertos` header (no public routes). In-app catalog search
+  (map panel) uses the user's own key from a password field. Kaggle
+  andasampa/height-model is anonymously downloadable via
+  `kagglehub.dataset_download('andasampa/height-model')` but is 49.1GB of
+  full-city rasters — not bundled; the SP LiDAR integration below covers the
+  app's SP areas from the primary source.
 - São Paulo LiDAR height model — `atlas_lidar_sp.js` (417KB): 4m uint8
   above-ground-height grids for the two SP preset areas, computed from the
   open PMSP 2017 LiDAR EPT on AWS (`ept-m3dc-pmsp`, EPSG:31983; the Kaggle
