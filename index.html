@@ -511,7 +511,7 @@ let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
 let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {}, vehModelMats = {};
-let trailerMat = null;
+let trailerMat = null, vehDetailMat = null, vehModelGrouped = {};
 // truck cab liveries (trailers stay freight white)
 const TRUCK_PAINT=[0xc23b3b,0x2b5fa8,0x2e7d46,0xd97a1a,0x555a63,0xe6e6e6];
 let camAnim = null, timeAnim = null;
@@ -1160,6 +1160,10 @@ function buildSharedMaterials(){
   wheelMat=new THREE.MeshStandardMaterial({color:0x17181c,roughness:.92,metalness:.1});
   trailerMat=new THREE.MeshStandardMaterial({color:0xe8e8ea,roughness:.6,metalness:.25,
     emissive:0xfff6d8,emissiveIntensity:.2,side:THREE.DoubleSide});
+  // dark glass/wheels/trim bucket of two-material vehicle models; near-black
+  // so per-instance body paint barely tints it, small emissive = night windows
+  vehDetailMat=new THREE.MeshStandardMaterial({color:0x101216,roughness:.35,
+    metalness:.5,emissive:0xfff6d8,emissiveIntensity:.25,side:THREE.DoubleSide});
   matCar=vehMats[0];
 }
 
@@ -1616,9 +1620,10 @@ const VEH_TYPES=[
    boxes:[[2.25,1.50,2.15,1.20,3.35],[2.42,2.20,6.40,1.55,-0.85]],   // cab + cargo box
    wheels:{r:0.45,w:0.34,ax:0.95,zs:[3.20,-0.70,-2.70]}},            // 6 wheels
 ];
-// Brazilian fleet skews heavily white/silver
-const VEH_PAINT=[[0xf2f2f2,.32],[0xc9ccd2,.24],[0x7a7f87,.12],[0x14161a,.12],
-  [0x8e1f1f,.09],[0x1e3a6e,.06],[0xd9a70d,.03],[0x2e5e35,.02]];
+// Brazilian fleet skews white/silver, with a wider colourful tail
+const VEH_PAINT=[[0xf2f2f2,.26],[0xc9ccd2,.20],[0x7a7f87,.10],[0x14161a,.10],
+  [0x8e1f1f,.08],[0x1e3a6e,.07],[0xd9a70d,.05],[0x2e5e35,.04],
+  [0xc2452d,.04],[0x1f8a8a,.03],[0x6b3fa0,.03]];
 function pickPaint(){
   let r=Math.random();
   for(const [c,w] of VEH_PAINT){ if((r-=w)<=0) return c; }
@@ -1656,10 +1661,27 @@ function vehicleGeometry(t){
    ['bus','models/bus.glb'],['truck','models/truck.glb'],
    ['truckTrailer','models/truck_trailer.glb']]
   .forEach(([key,url])=>loader.load(url,g=>{
-    let geo=null,mat=null;
-    g.scene.traverse(o=>{ if(o.isMesh&&!geo){ geo=o.geometry; mat=o.material; } });
-    if(!geo) return;
-    if(!geo.attributes.normal) geo.computeVertexNormals();
+    const parts=[];
+    g.scene.traverse(o=>{ if(o.isMesh) parts.push(o); });
+    if(!parts.length) return;
+    let geo,mat=parts[0].material,grouped=false;
+    if(parts.length===1){
+      geo=parts[0].geometry;
+      if(!geo.attributes.normal) geo.computeVertexNormals();
+    }else{
+      // two-material models: 'body' primitive (painted per instance) +
+      // 'detail' primitive (dark glass/wheels/trim) merged into one
+      // geometry with groups -> material array on the InstancedMesh
+      parts.sort((a,b)=>((a.name||'').includes('body')?0:1)-((b.name||'').includes('body')?0:1));
+      const cleaned=parts.map(p=>{
+        const q=p.geometry.clone();
+        ['uv','uv1','uv2','color','tangent'].forEach(a=>{ if(q.attributes[a]) q.deleteAttribute(a); });
+        if(!q.attributes.normal) q.computeVertexNormals();
+        return q;
+      });
+      geo=mergeGeometries(cleaned,true);
+      grouped=true;
+    }
     if(key==='truck'||key==='truckTrailer')
       geo.rotateY(Math.PI);   // source rig faces -Z (drove backwards)
     if(key==='bus'&&mat&&mat.map){
@@ -1667,8 +1689,8 @@ function vehicleGeometry(t){
       mat.side=THREE.DoubleSide; mat.metalness=0.2; mat.roughness=0.7;
       vehModelMats.bus=mat;
     }
-    vehModelGeos[key]=geo;
-    if(key!=='truckTrailer') log(`Traffic: GLB ${key} model active`,'ai');
+    vehModelGeos[key]=geo; vehModelGrouped[key]=grouped;
+    if(key!=='truckTrailer') log(`Traffic: GLB ${key} model active${grouped?' (body+detail)':''}`,'ai');
     if(appState==='city'&&trafficPaths.length) buildTraffic();   // hot-swap
   },undefined,()=>log(`GLB ${key} model unavailable - box fallback`,'ai')));
 })();
@@ -1691,8 +1713,10 @@ function buildTraffic(){
     if(!pool.length) return;
     const n=Math.max(1,Math.round(N*t.share));
     const modelGeo=vehModelGeos[t.key];
-    // bus: use the model's own baked livery/window texture when present
-    const mat=(t.key==='bus'&&vehModelMats.bus)?vehModelMats.bus:vehMats[ti];
+    // bus: baked livery texture; grouped models: painted body + dark detail
+    const mat=(t.key==='bus'&&vehModelMats.bus)?vehModelMats.bus
+             :vehModelGrouped[t.key]?[vehMats[ti],vehDetailMat]
+             :vehMats[ti];
     const mesh=modelGeo
       ? new THREE.InstancedMesh(modelGeo,mat,n)                  // GLB: painted per instance
       : new THREE.InstancedMesh(vehicleGeometry(t),[vehMats[ti],wheelMat],n);
@@ -2622,6 +2646,7 @@ function applyAtmosphere(){
   matRoadMajor.emissiveIntensity=0.05+night*1.1;
   matRoadMinor.emissiveIntensity=0.03+night*0.55;
   vehMats.forEach(m=>m.emissiveIntensity=0.3+night*2.6);
+  if(vehDetailMat) vehDetailMat.emissiveIntensity=0.25+night*2.2;  // window glow
   if(lampGlowMat) lampGlowMat.emissiveIntensity=0.2+night*3.2;
   if(streetLampMat) streetLampMat.emissiveIntensity=(0.15+night*3.6)*nightCalib;
   if(lampSpriteMat) lampSpriteMat.opacity=night*0.8*Math.min(nightCalib,1.25);
