@@ -172,6 +172,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 <script src="atlas_ibge_mesh.js" defer></script>
 <script src="atlas_ibge_geosci.js" defer></script>
 <script src="atlas_crime_data.js" defer></script>
+<script src="atlas_cadastral.js" defer></script>
 <script src="atlas_ms_buildings.js" defer></script>
 <script src="atlas_lidar_sp.js" defer></script>
 <script src="atlas_merge.js" defer></script>
@@ -424,7 +425,10 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <div class="slider-row" style="margin-top:12px"><span>Traffic fleet</span><b id="fleetTotal">0</b></div>
     <div id="fleetLegend" style="display:flex;gap:12px;flex-wrap:wrap;font-size:.72rem;color:#93a3bc"></div>
 
-    <button id="cellBtn" class="ghost" style="margin-top:12px">&#128246; Plan cell coverage</button>
+    <div class="btn-row" style="margin-top:12px">
+      <button id="cellBtn" class="ghost">&#128246; Plan cell coverage</button>
+      <button id="cadBtn" class="ghost">Cadastral: OFF</button>
+    </div>
 
     <div id="stats" style="display:grid">
       <div class="stat"><span class="v" id="stBuildings">0</span><span class="k">Real buildings</span></div>
@@ -3526,6 +3530,64 @@ function runCellPlan(){
 $('cellBtn').addEventListener('click',runCellPlan);
 
 /* ============================================================
+   CADASTRAL BOUNDARY LINES (IBGE 2022 census sectors)
+   Official sub-neighbourhood boundary lines, geo-located on the 3D
+   ground as pure line work (no fills). Precomputed per Brazilian
+   area from the IBGE WFS - the parcel-level municipal cadastre
+   (geo360) is auth-walled, and the WFS itself blocks browser
+   fetches (no CORS), hence the offline bundle. Shared borders are
+   deduplicated so each line ships once.
+============================================================ */
+// Pure (unit-tested): keep segments whose extent overlaps the bbox -
+// endpoint tests would drop long boundary lines crossing the zone
+function cadSegmentsInBox(segs,b){
+  return segs.filter(s=>{
+    const laMin=Math.min(s[0],s[2]),laMax=Math.max(s[0],s[2]);
+    const loMin=Math.min(s[1],s[3]),loMax=Math.max(s[1],s[3]);
+    return laMax>=b.S&&laMin<=b.N&&loMax>=b.W&&loMin<=b.E;
+  });
+}
+let cadGroup=null;
+function clearCadastral(){
+  if(cadGroup){
+    scene.remove(cadGroup);
+    cadGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    cadGroup=null;
+  }
+  const b=$('cadBtn');
+  if(b){ b.textContent='Cadastral: OFF'; b.classList.remove('active-mode'); }
+}
+function toggleCadastral(){
+  if(cadGroup){ clearCadastral(); return; }
+  if(appState!=='city'||!geoCtx) return;
+  const C=window.ATLAS_CADASTRAL;
+  const segs=C&&C.areas&&C.areas[geoCtx.placeName];
+  if(!segs){
+    log('Cadastral boundaries: precomputed for Brazilian preset areas only '+
+        '(IBGE 2022 census sectors; the source WFS blocks live browser fetches). '+
+        'Parcel-level cadastre (geo360) requires municipal credentials.','err');
+    return;
+  }
+  const use=cadSegmentsInBox(segs,geoCtx);
+  const pos=new Float32Array(use.length*6);
+  const {cLat,cLon,mPerLon}=geoCtx;
+  use.forEach((s,i)=>{
+    pos[i*6  ]=(s[1]-cLon)*mPerLon; pos[i*6+1]=0.5; pos[i*6+2]=(cLat-s[0])*M_LAT;
+    pos[i*6+3]=(s[3]-cLon)*mPerLon; pos[i*6+4]=0.5; pos[i*6+5]=(cLat-s[2])*M_LAT;
+  });
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  cadGroup=new THREE.Group();
+  cadGroup.add(new THREE.LineSegments(geo,
+    new THREE.LineBasicMaterial({color:0xffd24d,transparent:true,opacity:.85})));
+  scene.add(cadGroup);
+  $('cadBtn').textContent=`Cadastral: ${use.length} lines`;
+  $('cadBtn').classList.add('active-mode');
+  log(`Cadastral layer: ${use.length} census-sector boundary segments, geo-located (IBGE 2022)`,'ok');
+}
+$('cadBtn').addEventListener('click',toggleCadastral);
+
+/* ============================================================
    SIMULATED INFRASTRUCTURE LAYERS
    Runs once per build, after the real Overpass planner layers and the
    terrain fetch. Any layer with no OSM data in the zone is filled with
@@ -3886,6 +3948,7 @@ $('resetBtn').addEventListener('click',()=>{
   clearPollutionFX(); aqState=null;
   $('stAQ').innerHTML='&mdash;'; $('stAQ').style.color=''; $('stAQ').title='';
   removeLamps(); nightCalib=1;
+  clearCadastral();
   removeRain(); weatherState=null; climCache=null; simData=null;
   $('wxMonth').value='live'; $('wxVal').innerHTML='&mdash;'; $('wxInfo').textContent='';
   $('simWrap').style.display='none';
