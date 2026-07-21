@@ -510,7 +510,10 @@ let geoCtx = null;              // {cLat,cLon,mPerLon,W,E,S,N,sceneW,sceneH}
 let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
-let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {};
+let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {}, vehModelMats = {};
+let trailerMat = null;
+// truck cab liveries (trailers stay freight white)
+const TRUCK_PAINT=[0xc23b3b,0x2b5fa8,0x2e7d46,0xd97a1a,0x555a63,0xe6e6e6];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
@@ -1155,6 +1158,8 @@ function buildSharedMaterials(){
     metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35,
     side:THREE.DoubleSide}));
   wheelMat=new THREE.MeshStandardMaterial({color:0x17181c,roughness:.92,metalness:.1});
+  trailerMat=new THREE.MeshStandardMaterial({color:0xe8e8ea,roughness:.6,metalness:.25,
+    emissive:0xfff6d8,emissiveIntensity:.2,side:THREE.DoubleSide});
   matCar=vehMats[0];
 }
 
@@ -1648,21 +1653,30 @@ function vehicleGeometry(t){
 (()=>{
   const loader=new GLTFLoader();
   [['car','models/car.glb'],['van','models/van.glb'],
-   ['bus','models/bus.glb'],['truck','models/truck.glb']]
+   ['bus','models/bus.glb'],['truck','models/truck.glb'],
+   ['truckTrailer','models/truck_trailer.glb']]
   .forEach(([key,url])=>loader.load(url,g=>{
-    let geo=null;
-    g.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry; });
+    let geo=null,mat=null;
+    g.scene.traverse(o=>{ if(o.isMesh&&!geo){ geo=o.geometry; mat=o.material; } });
     if(!geo) return;
     if(!geo.attributes.normal) geo.computeVertexNormals();
-    if(key==='truck') geo.rotateY(Math.PI);   // source mesh faces -Z (drove backwards)
+    if(key==='truck'||key==='truckTrailer')
+      geo.rotateY(Math.PI);   // source rig faces -Z (drove backwards)
+    if(key==='bus'&&mat&&mat.map){
+      // the bus ships its baked livery/window texture - use it as-is
+      mat.side=THREE.DoubleSide; mat.metalness=0.2; mat.roughness=0.7;
+      vehModelMats.bus=mat;
+    }
     vehModelGeos[key]=geo;
-    log(`Traffic: GLB ${key} model active`,'ai');
+    if(key!=='truckTrailer') log(`Traffic: GLB ${key} model active`,'ai');
     if(appState==='city'&&trafficPaths.length) buildTraffic();   // hot-swap
   },undefined,()=>log(`GLB ${key} model unavailable - box fallback`,'ai')));
 })();
 
 function removeTraffic(){
-  trafficMeshes.forEach(m=>{ scene.remove(m);
+  trafficMeshes.forEach(m=>{
+    if(m.userData.buddy) scene.remove(m.userData.buddy);  // trailer rides along
+    scene.remove(m);
     if(!m.userData.sharedGeo) m.geometry.dispose(); });   // GLB geometry is reused
   trafficMeshes=[]; trafficMesh=null; cars=[];
 }
@@ -1677,18 +1691,30 @@ function buildTraffic(){
     if(!pool.length) return;
     const n=Math.max(1,Math.round(N*t.share));
     const modelGeo=vehModelGeos[t.key];
+    // bus: use the model's own baked livery/window texture when present
+    const mat=(t.key==='bus'&&vehModelMats.bus)?vehModelMats.bus:vehMats[ti];
     const mesh=modelGeo
-      ? new THREE.InstancedMesh(modelGeo,vehMats[ti],n)          // GLB: one material, painted per instance
+      ? new THREE.InstancedMesh(modelGeo,mat,n)                  // GLB: painted per instance
       : new THREE.InstancedMesh(vehicleGeometry(t),[vehMats[ti],wheelMat],n);
     mesh.userData.sharedGeo=!!modelGeo;
+    // semi trucks tow a separate freight-white trailer that shares
+    // each instance's matrix (so the cab can be painted independently)
+    if(t.key==='truck'&&modelGeo&&vehModelGeos.truckTrailer){
+      const trailer=new THREE.InstancedMesh(vehModelGeos.truckTrailer,trailerMat,n);
+      trailer.castShadow=true; trailer.userData.sharedGeo=true;
+      mesh.userData.buddy=trailer; scene.add(trailer);
+    }
     mesh.castShadow=true;
     for(let i=0;i<n;i++){
       const p=pool[Math.floor(Math.random()*pool.length)];
       cars.push({path:p, d:Math.random()*p.total,
         v:t.vMin+Math.random()*(t.vMax-t.vMin),
         dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, pool});
-      mesh.setColorAt(i,col.setHex(
-        t.key==='bus'?0xd97a1a : t.key==='truck'?0xe6e6e6 : pickPaint()));
+      if(t.key==='bus'&&vehModelMats.bus){ /* textured livery - no tint */ }
+      else mesh.setColorAt(i,col.setHex(
+        t.key==='bus'?0xd97a1a
+        : t.key==='truck'?TRUCK_PAINT[Math.floor(Math.random()*TRUCK_PAINT.length)]
+        : pickPaint()));
     }
     if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
     mesh.userData.fleetCount=n;
@@ -1730,9 +1756,14 @@ function updateTraffic(dt){
     _ce.set(0,face,0);
     _cq.setFromEuler(_ce);
     _cm.compose(_cp.set(p.x+lo.ox,0.02,p.z+lo.oz),_cq,_cs);
-    trafficMeshes[c.ti].setMatrixAt(c.mi,_cm);
+    const tm=trafficMeshes[c.ti];
+    tm.setMatrixAt(c.mi,_cm);
+    if(tm.userData.buddy) tm.userData.buddy.setMatrixAt(c.mi,_cm);
   }
-  trafficMeshes.forEach(m=>m.instanceMatrix.needsUpdate=true);
+  trafficMeshes.forEach(m=>{
+    m.instanceMatrix.needsUpdate=true;
+    if(m.userData.buddy) m.userData.buddy.instanceMatrix.needsUpdate=true;
+  });
 }
 
 /* ============================================================
