@@ -1724,6 +1724,9 @@ function removeTraffic(){
 function buildTraffic(){
   removeTraffic();
   if(!trafficPaths.length) return;
+  roadNet=buildRoadNetwork(trafficPaths,
+    geoCtx?geoCtx.sceneW/2:800, geoCtx?geoCtx.sceneH/2:800);
+  log(`Traffic network: ${roadNet.portalList.length} edge portals for entry/exit`,'ai');
   const majors=trafficPaths.filter(p=>p.major);
   const N=Math.min(GFX[gfxTier].traffic,trafficPaths.length*3);
   const col=new THREE.Color();
@@ -1748,11 +1751,12 @@ function buildTraffic(){
       mesh.userData.buddy=trailer; scene.add(trailer);
     }
     mesh.castShadow=true;
+    const poolIdx=trafficPaths.map((p,i)=>i).filter(i=>!t.majorOnly||trafficPaths[i].major);
     for(let i=0;i<n;i++){
-      const p=pool[Math.floor(Math.random()*pool.length)];
-      cars.push({path:p, d:Math.random()*p.total,
+      const pi=poolIdx[Math.floor(Math.random()*poolIdx.length)];
+      cars.push({pi, d:Math.random()*trafficPaths[pi].total,
         v:t.vMin+Math.random()*(t.vMax-t.vMin),
-        dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, pool});
+        dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, mo:t.majorOnly});
       if(t.key==='bus'&&vehModelMats.bus){ /* textured livery - no tint */ }
       else mesh.setColorAt(i,col.setHex(
         t.key==='bus'?0xd97a1a
@@ -1764,6 +1768,11 @@ function buildTraffic(){
     trafficMeshes.push(mesh); scene.add(mesh);
   });
   trafficMesh=trafficMeshes[0]||null;   // legacy handle used by reset guard
+  // read-only debug sampler (used by automated continuity verification)
+  window.__atlasTrafficSample=()=>cars.slice(0,40).map(c=>{
+    const q=pointOnPath(trafficPaths[c.pi],c.d);
+    return {pi:c.pi,x:Math.round(q.x*10)/10,z:Math.round(q.z*10)/10,v:c.v};
+  });
   // Font Awesome fleet legend in the panel
   const FLEET_FA={car:'fa-car',moto:'fa-motorcycle',van:'fa-van-shuttle',
     bus:'fa-bus',truck:'fa-truck'};
@@ -1774,6 +1783,70 @@ function buildTraffic(){
     ` style="color:#9fc2e8;margin-right:4px"></i>${counts[t.key]}</span>`).join('');
   $('fleetTotal').textContent=cars.length;
 }
+/* ---- road-network continuity ----
+   Vehicles never teleport mid-scene: at a junction they continue onto a
+   connected segment, at an interior dead end they U-turn, and only at a
+   PORTAL (a road endpoint at the scene edge) do they exit - immediately
+   replaced by a fresh vehicle entering at another portal. All appearing/
+   disappearing happens at the boundary, like real through-traffic. */
+const JUNCTION_TOL=6, JUNCTION_CELL=8;
+function _pathEnd(p,end){ return end?p.pts[p.pts.length-1]:p.pts[0]; }
+// Pure (unit-tested): spatial index of path endpoints + edge portals
+function buildRoadNetwork(paths,halfW,halfH){
+  const cellMap=new Map();
+  const ck=(x,z)=>Math.round(x/JUNCTION_CELL)+','+Math.round(z/JUNCTION_CELL);
+  paths.forEach((p,i)=>{ [0,1].forEach(end=>{
+    const pt=_pathEnd(p,end), k=ck(pt.x,pt.z);
+    if(!cellMap.has(k)) cellMap.set(k,[]);
+    cellMap.get(k).push({p:i,end});
+  });});
+  const portals=new Set(), portalList=[];
+  paths.forEach((p,i)=>{ [0,1].forEach(end=>{
+    const pt=_pathEnd(p,end);
+    if(Math.abs(pt.x)>halfW*0.92||Math.abs(pt.z)>halfH*0.92){
+      portals.add(i+':'+end); portalList.push({p:i,end});
+    }
+  });});
+  return {cellMap,portals,portalList,ck};
+}
+function _near(net,paths,pt){
+  const cx=Math.round(pt.x/JUNCTION_CELL), cz=Math.round(pt.z/JUNCTION_CELL);
+  const out=[];
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){
+    const lst=net.cellMap.get((cx+dx)+','+(cz+dz));
+    if(!lst) continue;
+    for(const e of lst){
+      const q=_pathEnd(paths[e.p],e.end);
+      if(Math.hypot(q.x-pt.x,q.z-pt.z)<=JUNCTION_TOL) out.push(e);
+    }
+  }
+  return out;
+}
+// Pure (unit-tested): arriving at end `arrEnd` of path `pi`, pick the next
+// leg - a connected segment (entered at its touching end, travelling away),
+// or a U-turn when the junction is a dead end / nothing is allowed.
+function nextLeg(paths,net,pi,arrEnd,rand,allow){
+  const pt=_pathEnd(paths[pi],arrEnd);
+  const cands=_near(net,paths,pt)
+    .filter(e=>!(e.p===pi&&e.end===arrEnd))
+    .filter(e=>!allow||allow(e.p));
+  if(!cands.length)
+    return {p:pi,dir:arrEnd?-1:1,d:arrEnd?paths[pi].total-0.1:0.1};   // U-turn
+  const c=cands[Math.floor(rand()*cands.length)];
+  return {p:c.p,dir:c.end?-1:1,d:c.end?paths[c.p].total-0.1:0.1};
+}
+// Pure (unit-tested): enter the scene at a random edge portal, driving inward
+function spawnLeg(paths,net,rand,allow){
+  const ps=net.portalList.filter(e=>!allow||allow(e.p));
+  if(!ps.length){                       // no allowed portal: appear mid-path
+    const idxs=paths.map((_,i)=>i).filter(i=>!allow||allow(i));
+    const i=idxs[Math.floor(rand()*idxs.length)];
+    return {p:i,dir:rand()>.5?1:-1,d:rand()*paths[i].total};
+  }
+  const e=ps[Math.floor(rand()*ps.length)];
+  return {p:e.p,dir:e.end?-1:1,d:e.end?paths[e.p].total-0.1:0.1};
+}
+let roadNet=null;
 const _cm=new THREE.Matrix4(), _cq=new THREE.Quaternion(), _cs=new THREE.Vector3(1,1,1),
       _ce=new THREE.Euler(), _cp=new THREE.Vector3();
 function pointOnPath(p,d){
@@ -1788,12 +1861,20 @@ function updateTraffic(dt){
   for(let i=0;i<cars.length;i++){
     const c=cars[i];
     c.d+=c.v*dt*c.dir;
-    if(c.d>=c.path.total||c.d<=0){
-      c.path=c.pool[Math.floor(Math.random()*c.pool.length)];
-      c.dir=Math.random()>.5?1:-1;
-      c.d=c.dir>0?0.1:c.path.total-0.1;
+    const path=trafficPaths[c.pi];
+    if(c.d>=path.total||c.d<=0){
+      const arrEnd=c.d<=0?0:1;
+      const allow=idx=>!c.mo||trafficPaths[idx].major;
+      let leg;
+      if(roadNet&&roadNet.portals.has(c.pi+':'+arrEnd))
+        leg=spawnLeg(trafficPaths,roadNet,Math.random,allow);   // exit -> new arrival
+      else if(roadNet)
+        leg=nextLeg(trafficPaths,roadNet,c.pi,arrEnd,Math.random,allow); // continue/U-turn
+      else
+        leg=spawnLeg(trafficPaths,{portalList:[]},Math.random,allow);
+      c.pi=leg.p; c.dir=leg.dir; c.d=leg.d;
     }
-    const p=pointOnPath(c.path,c.d);
+    const p=pointOnPath(trafficPaths[c.pi],c.d);
     const face=p.yaw+(c.dir<0?Math.PI:0);
     const lo=laneOffset(p.yaw,c.dir,c.lane);
     _ce.set(0,face,0);
