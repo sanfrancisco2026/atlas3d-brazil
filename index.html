@@ -960,6 +960,19 @@ const GFX={
   medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150},
   low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90},
 };
+// WebGL availability diagnostics. When both contexts are refused but the GPU
+// is healthy elsewhere, the usual culprit is a fingerprint-blocking extension
+// that monkey-patches canvas.getContext - which we can detect: a native method
+// stringifies to "[native code]", a wrapped one does not.
+function webglDiag(){
+  const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
+  const g2=probe('webgl2'), g1=probe('webgl');
+  let patched=false;
+  try{ patched=!/\[native code\]/.test(HTMLCanvasElement.prototype.getContext.toString()); }catch(e){}
+  return {g2,g1,patched,
+    line:`Diagnostics - WebGL2: ${g2?'yes':'NO'} · WebGL1: ${g1?'yes':'NO'}`+
+      (patched?' · getContext is MODIFIED (an extension is intercepting it)':'')};
+}
 function createRenderer(){
   // Try progressively humbler context profiles: machines whose discrete
   // GPU / driver refuses a high-performance antialiased context often
@@ -994,13 +1007,18 @@ function createRenderer(){
     }
   }catch(e){ lastErr=e; }
   // report exactly what this browser offers, to guide the fix
-  const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
-  log(`Diagnostics - WebGL2: ${probe('webgl2')?'yes':'NO'} · WebGL1: ${probe('webgl')?'yes':'NO'}`,'err');
+  const d=webglDiag();
+  log(d.line,'err');
   log('Browser: '+navigator.userAgent,'err');
-  log('Both NO here = THIS page is blocked from WebGL. Usual causes: a privacy/'+
-      'ad-block extension (fingerprint protection), Brave shields, or opening the '+
-      'app in an embedded preview instead of a real browser tab. Try an '+
-      'incognito/InPrivate window with extensions off, or another browser.','err');
+  if(d.patched)
+    log('An EXTENSION is intercepting canvas.getContext (fingerprint/privacy '+
+        'blocker). Disable it for localhost, or use an incognito window with '+
+        'extensions off.','err');
+  else
+    log('Both NO here = THIS page is blocked from WebGL. Usual causes: a privacy/'+
+        'ad-block extension, Brave shields, hardware acceleration off '+
+        '(chrome://settings/system), or an embedded preview. Try incognito with '+
+        'extensions off, or another browser.','err');
   throw lastErr||new Error('WebGL unavailable');
 }
 function initThree(){
@@ -3680,11 +3698,18 @@ function step(id,state){ const el=$(id);
 $('buildBtn').addEventListener('click',async()=>{
   if(appState!=='map') return;
   if(!renderer){
-    const probe=t=>{ try{ return !!document.createElement('canvas').getContext(t); }catch(e){ return false; } };
+    const d=webglDiag();
     log('Cannot build: the 3D engine never started (WebGL unavailable).','err');
-    log(`Diagnostics - WebGL2: ${probe('webgl2')?'yes':'NO'} · WebGL1: ${probe('webgl')?'yes':'NO'} · ${navigator.userAgent}`,'err');
-    log('Decisive test: open this page in an INCOGNITO window (extensions off). If it builds there, a privacy/ad-block extension is blocking WebGL on localhost - whitelist it.','err');
-    log('Otherwise: try another browser (e.g. Edge), close other 3D tabs, fully restart the browser.','err');
+    log(d.line+' · '+navigator.userAgent,'err');
+    if(d.patched)
+      log('An EXTENSION is intercepting canvas.getContext - a privacy/fingerprint '+
+          'blocker (uBlock advanced, Privacy Badger, CanvasBlocker, McAfee/VPN '+
+          'extensions...). Disable it for localhost, or use incognito with '+
+          'extensions off.','err');
+    else{
+      log('Decisive test: open this page in an INCOGNITO window (extensions off). If it builds there, an extension is blocking WebGL on localhost - whitelist it.','err');
+      log('Otherwise: enable hardware acceleration (chrome://settings/system), try Edge, close other 3D tabs, fully restart the browser.','err');
+    }
     return;
   }
   appState='building';
