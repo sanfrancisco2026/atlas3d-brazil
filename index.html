@@ -865,9 +865,11 @@ async function stitchSatelliteAt(b,z){
   return {canvas,w,h,okTiles,total:jobs.length};
 }
 async function fetchSatellite(b){
-  // pick zoom so the stitched image is ~1200-2600 px wide
+  // pick zoom so the stitched image is ~1200-2600 px wide (3200 on
+  // high/medium GPUs - keeps the rooftop vertical imagery crisper)
   let z=18;
-  while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > 2600) z--;
+  const maxPx=gfxTier==='low'?2600:3200;
+  while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > maxPx) z--;
   // Esri has no high-zoom imagery for many smaller towns: if most tiles
   // 404 at this zoom, step down until the mosaic actually fills in.
   let s=await stitchSatelliteAt(b,z);
@@ -1155,6 +1157,13 @@ function pickPaneFlips(n,k,rand){
   while(s.size<k&&guard-->0) s.add(Math.floor(rand()*n));
   return [...s];
 }
+// Real-world facade module: ~3.6m window bay, ~3.0m floor height.
+const WINDOW_W=3.6, FLOOR_H=3.0;
+// Pure (unit-tested): whole window bays for a wall edge, whole floors for
+// a building height - facade UVs stretch to EXACTLY this many bays/rows,
+// so mullions land on building corners and rows land on the parapet.
+function windowCols(len){ return Math.max(1,Math.round(len/WINDOW_W)); }
+function floorRows(hEff){ return Math.max(1,Math.round(hEff/FLOOR_H)); }
 // Pure (unit-tested): per-window dressing decisions for the facade painter.
 // Glass towers get dark mullion frames + occasional blinds/reflection
 // streaks; masonry/concrete get light frames, sills, curtains/blinds and
@@ -1585,12 +1594,49 @@ function buildBuildings(osm){
     const geom=new THREE.ExtrudeGeometry(shape,{depth:h-minH,bevelEnabled:false});
     geom.rotateX(Math.PI/2); geom.translate(0,h,0);
 
-    // UVs: roof gets satellite projection, walls get facade grid (3.6m windows)
+    // UVs. Caps (material group 0): satellite projection, untouched - the
+    // roof keeps the vertical mosaic image pixel-true. Walls (group 1):
+    // architecture-aligned grid replacing the old diagonal projection
+    // ((x+z)/14.4), which smeared windows on walls perpendicular to the
+    // x+z axis, cut bays mid-window at corners, and let wall-TOP vertices
+    // fall into the y>=h roof branch (facade stretched to satellite
+    // coords at the parapet). Now: each wall edge gets a WHOLE number of
+    // 3.6m window bays (mullions land exactly on corners), the height a
+    // WHOLE number of ~3m floors (rows land exactly on the parapet).
     const pos=geom.attributes.position, uv=geom.attributes.uv;
-    for(let i=0;i<pos.count;i++){
-      const x=pos.getX(i), y=pos.getY(i), zz=pos.getZ(i);
-      if(y>=h-0.08) uv.setXY(i,(x+halfW)/sceneW,1-(zz+halfH)/sceneH);
-      else uv.setXY(i,(x+zz)/14.4, y/14.4);
+    const hEff=Math.max(h-minH,0.1);
+    const vScale=floorRows(hEff)/8/hEff;            // texture = 8 rows/tile
+    const ek=(vx,vz)=>(Math.round(vx*100)/100).toFixed(2)+','+(Math.round(vz*100)/100).toFixed(2);
+    const edgeWin=new Map();                        // canonical edge -> bays
+    for(let i=0;i<p.pts.length-1;i++){
+      const A=p.pts[i], B=p.pts[i+1];
+      const len=Math.hypot(B.x-A.x,B.y-A.y); if(len<1e-6) continue;
+      const k1=ek(A.x,A.y), k2=ek(B.x,B.y);
+      edgeWin.set(k1<k2?k1+'|'+k2:k2+'|'+k1,windowCols(len));
+    }
+    for(const g of geom.groups){
+      if(g.materialIndex===0){                      // caps: satellite
+        for(let i=g.start;i<g.start+g.count;i++)
+          uv.setXY(i,(pos.getX(i)+halfW)/sceneW,1-(pos.getZ(i)+halfH)/sceneH);
+        continue;
+      }
+      // side quads: each triangle spans exactly one footprint edge (two
+      // xz columns). u runs 0 -> bays/4 between the columns in CANONICAL
+      // key order, so both triangles of a quad (and both quads of a
+      // wall) agree - no mirrored halves.
+      for(let t=g.start;t<g.start+g.count;t+=3){
+        const X=[pos.getX(t),pos.getX(t+1),pos.getX(t+2)];
+        const Z=[pos.getZ(t),pos.getZ(t+1),pos.getZ(t+2)];
+        let b=1;                                    // second distinct column
+        if(Math.abs(X[0]-X[1])<1e-4&&Math.abs(Z[0]-Z[1])<1e-4) b=2;
+        const kA=ek(X[0],Z[0]), kB=ek(X[b],Z[b]);
+        const lo=kA<kB?kA:kB;
+        const nWin=edgeWin.get(kA<kB?kA+'|'+kB:kB+'|'+kA)
+          ||windowCols(Math.hypot(X[b]-X[0],Z[b]-Z[0]));
+        for(let j=0;j<3;j++)
+          uv.setXY(t+j, ek(X[j],Z[j])===lo?0:nWin/4,   // texture = 4 bays/tile
+            (pos.getY(t+j)-minH)*vScale);
+      }
     }
     // vertex tint from satellite pixel at centroid; synthetic gets a cool cast
     const tint=satPixel(p.sLat,p.sLon).lerp(new THREE.Color(1,1,1),0.45);
@@ -3832,8 +3878,14 @@ function buildGreenscape(){
    at the densest uncovered spots - until dead zones are gone (or the
    cap is hit). Urban microcell radius ~280m.
 ============================================================ */
-const CELL_R=280, CELL_MAX_NEW=6;
-// Pure (unit-tested) greedy set-cover.
+const CELL_R=280, CELL_MAX_NEW=40;   // cap is a safety net, not a target -
+                                     // the greedy runs until no dead zones
+// Pure (unit-tested) greedy set-cover with siting justification.
+// Each round places one tower on the building whose roof reaches the most
+// still-uncovered buildings (fewest-towers guarantee of greedy set-cover);
+// ties go to the TALLER host roof (better line-of-sight). Each site
+// records its justification: host roof height, buildings newly covered,
+// share of the then-remaining gap, and distance to the nearest other site.
 function planCellTowers(demand,existing,R,maxNew){
   const R2=R*R;
   const inR=(a,b)=>(a.x-b.x)*(a.x-b.x)+(a.z-b.z)*(a.z-b.z)<=R2;
@@ -3847,10 +3899,18 @@ function planCellTowers(demand,existing,R,maxNew){
     let best=-1,bestCov=[];
     for(let ci=0;ci<demand.length;ci++){
       const cov=uncovered.filter(i=>inR(demand[i],demand[ci]));
-      if(cov.length>bestCov.length){ best=ci; bestCov=cov; }
+      if(cov.length>bestCov.length||
+         (cov.length&&cov.length===bestCov.length&&best>=0&&
+          (demand[ci].h||0)>(demand[best].h||0))){ best=ci; bestCov=cov; }
     }
-    if(best<0) break;
-    newSites.push({x:demand[best].x,z:demand[best].z,covers:bestCov.length});
+    if(best<0||!bestCov.length) break;
+    let gap=null;                       // distance to nearest other site
+    for(const o of existing.concat(newSites)){
+      const dd=Math.hypot(demand[best].x-o.x,demand[best].z-o.z);
+      if(gap==null||dd<gap) gap=dd;
+    }
+    newSites.push({x:demand[best].x,z:demand[best].z,covers:bestCov.length,
+      hostH:demand[best].h||0, share:bestCov.length/uncovered.length, gap});
     const rm=new Set(bestCov);
     uncovered=uncovered.filter(i=>!rm.has(i));
   }
@@ -3870,7 +3930,8 @@ function runCellPlan(){
   if(cellPlanGroup){ clearCellPlan(); return; }   // toggle off
   const demand=cityGroup.children.filter(m=>m.userData&&m.userData.lat).map(m=>({
     x:(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon,
-    z:(geoCtx.cLat-m.userData.lat)*M_LAT}));
+    z:(geoCtx.cLat-m.userData.lat)*M_LAT,
+    h:m.userData.h||0}));
   if(!demand.length){ log('Cell planner: no mapped buildings to cover','err'); return; }
   const plan=planCellTowers(demand,telecomSites,CELL_R,CELL_MAX_NEW);
   cellPlanGroup=new THREE.Group();
@@ -3885,19 +3946,32 @@ function runCellPlan(){
   telecomSites.forEach(s=>disc(s.x,s.z,0xc77dff,0.06));
   plan.newSites.forEach(s=>{
     disc(s.x,s.z,0x4dff9d,0.08);
+    // mast mounted ON its host rooftop, not floating at a fixed height
     const im=new THREE.SpriteMaterial({map:iconTexture('wave','#4dff9d'),transparent:true,depthWrite:false});
-    const sp=new THREE.Sprite(im); sp.position.set(s.x,26,s.z); sp.scale.set(11,11,1);
+    const sp=new THREE.Sprite(im); sp.position.set(s.x,s.hostH+22,s.z); sp.scale.set(11,11,1);
     cellPlanGroup.add(sp);
-    const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.4,24,6),
+    const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.4,18,6),
       new THREE.MeshStandardMaterial({color:0x3a4048,roughness:.8}));
-    pole.position.set(s.x,12,s.z); cellPlanGroup.add(pole);
+    pole.position.set(s.x,s.hostH+9,s.z); cellPlanGroup.add(pole);
   });
   scene.add(cellPlanGroup);
   const pct=v=>Math.round(v*100)+'%';
+  // compass sector of a site, for the human-readable justification
+  const sector=(x,z)=>['N','NE','E','SE','S','SW','W','NW'][
+    Math.round(((Math.atan2(x,-z)*180/Math.PI+360)%360)/45)%8];
   log(`Cell coverage: ${telecomSites.length} existing site(s) cover ${pct(plan.beforeFrac)} of buildings`,'ai');
+  log(`Siting strategy: greedy set-cover - each tower takes the rooftop that`+
+    ` reaches the most still-uncovered buildings (fewest towers for full`+
+    ` coverage); ties go to the taller roof for line-of-sight; ${CELL_R}m`+
+    ` urban microcell radius`,'ai');
+  plan.newSites.forEach((s,i)=>{
+    log(`Tower ${i+1} (${sector(s.x,s.z)} sector): on the ${Math.round(s.hostH)}m rooftop - `+
+      `covers ${s.covers} uncovered buildings (${Math.round(s.share*100)}% of the gap left before it)`+
+      (s.gap!=null?`; ${Math.round(s.gap)}m from the nearest other site`:'; first site in the zone'),'ai');
+  });
   log(plan.newSites.length
     ? `+${plan.newSites.length} proposed tower(s) -> ${pct(plan.afterFrac)} covered`+
-      (plan.deadZone?` (${plan.deadZone} buildings still out of reach at the ${CELL_MAX_NEW}-tower cap)`:' - no dead zones')
+      (plan.deadZone?` (${plan.deadZone} buildings still out of reach at the ${CELL_MAX_NEW}-tower safety cap)`:' - FULL coverage, no dead zones')
     : `no new towers needed - coverage already ${pct(plan.afterFrac)}`,'ok');
   $('cellBtn').innerHTML='&#128246; Coverage plan: ON';
   $('cellBtn').classList.add('active-mode');
