@@ -529,6 +529,7 @@ const BUS_PAINT=[0xffffff,0xfff0a8,0xffd9a8,0xcfe4ff,0xd4f2cc,0xffc9c9];
 const VAN_PAINT=[0xf2f2f2,0x9fc7e8,0xd94f4f,0x7fb069,0xe8c34d,0xe8955f];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
+let facadeAnim = [], facadeTickT = 0, facadeTickI = 0, nightNow = 0;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
@@ -1136,6 +1137,28 @@ function pickFacadeVariant(h,area,r){
   if(area>2500&&h>12&&r<0.7) return 0;
   return r>0.5?1:2;
 }
+// Pure (unit-tested): which glass family a glazed building gets -
+// 0 cool-blue curtain, 3 emerald, 4 bronze/smoked, 5 silver mirror
+// (ribbon glazing). Supertalls skew mirror/blue - the landmark look.
+function pickGlassStyle(h,r){
+  if(h>100) return r<0.5?5:0;
+  if(r<0.30) return 0;
+  if(r<0.55) return 3;
+  if(r<0.80) return 4;
+  return 5;
+}
+// Pure (unit-tested): k distinct pane indices out of n from a rand stream -
+// which panes flick on/off this tick of the night facade animation
+function pickPaneFlips(n,k,rand){
+  const s=new Set(); k=Math.min(k,n);
+  let guard=n*20+20;
+  while(s.size<k&&guard-->0) s.add(Math.floor(rand()*n));
+  return [...s];
+}
+// Facade families: 0 cool-blue curtain, 1 punched masonry, 2 concrete
+// band, 3 emerald curtain, 4 bronze/smoked curtain, 5 silver-mirror
+// ribbon glazing. 0/3/4/5 are the glazed-glass exteriors.
+const GLASS_STYLES=new Set([0,3,4,5]);
 function buildFacadeTexture(style,litRatio){
   const W=256,H=512;
   const a=document.createElement('canvas'); a.width=W; a.height=H;
@@ -1147,28 +1170,36 @@ function buildFacadeTexture(style,litRatio){
   const sx=sMapC.getContext('2d');
   sx.fillStyle='rgb(0,235,8)'; sx.fillRect(0,0,W,H);
   const ax=a.getContext('2d'), ex=e.getContext('2d');
-  ax.fillStyle='#b9b9bc'; ax.fillRect(0,0,W,H);
+  ax.fillStyle=style===5?'#c8ced4':style===4?'#8f887c':'#b9b9bc';   // mullion/base
+  ax.fillRect(0,0,W,H);
   ex.fillStyle='#000'; ex.fillRect(0,0,W,H);
   const rand=mulberry32(style*991+7);
   // subtle facade noise
   for(let i=0;i<900;i++){ ax.fillStyle=`rgba(0,0,0,${rand()*0.06})`;
     ax.fillRect(rand()*W,rand()*H,rand()*30,rand()*8); }
   const cols=4, rows=8, cw=W/cols, rh=H/rows;
+  const panes=[], lit=new Set();
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
     const x=c*cw, y=r*rh;
     let wx,wy,ww,wh;
-    if(style===0){ wx=x+3; wy=y+6; ww=cw-6; wh=rh-14; }         // glass curtain
+    if(style===5){ wx=x+1.5; wy=y+4; ww=cw-3; wh=rh*0.55; }     // ribbon band + spandrel
+    else if(GLASS_STYLES.has(style)){ wx=x+3; wy=y+6; ww=cw-6; wh=rh-14; } // glass curtain
     else if(style===1){ wx=x+cw*.22; wy=y+rh*.18; ww=cw*.56; wh=rh*.6; } // punched masonry
     else { wx=x+cw*.12; wy=y+rh*.3; ww=cw*.76; wh=rh*.42; }     // concrete band
-    const shade=30+rand()*40;
-    ax.fillStyle=`rgb(${shade},${shade+8},${shade+20})`;
+    const shade=style===4?24+rand()*34:style===5?42+rand()*46:30+rand()*40;
+    ax.fillStyle=style===3?`rgb(${Math.max(0,shade-8)},${shade+16},${shade+10})`  // emerald
+               :style===4?`rgb(${shade+16},${shade+6},${Math.max(0,shade-6)})`    // bronze
+               :style===5?`rgb(${shade+6},${shade+10},${shade+16})`               // silver
+               :`rgb(${shade},${shade+8},${shade+20})`;                           // cool blue
     ax.fillRect(wx,wy,ww,wh);
     ax.strokeStyle='rgba(255,255,255,.25)'; ax.lineWidth=1.5; ax.strokeRect(wx,wy,ww,wh);
     sx.fillStyle='rgb(0,45,185)'; sx.fillRect(wx,wy,ww,wh);   // pane: smooth + metallic
+    panes.push({x:wx+1,y:wy+1,w:ww-2,h:wh-2});
     if(rand()<litRatio){
       const warm=rand();
       ex.fillStyle=warm>.35?`rgba(255,${190+rand()*50|0},110,1)`:'rgba(180,215,255,1)';
       ex.fillRect(wx+1,wy+1,ww-2,wh-2);
+      lit.add(panes.length-1);
     }
   }
   if(style===1){ // brick tint
@@ -1180,27 +1211,36 @@ function buildFacadeTexture(style,litRatio){
     t.wrapS=t.wrapT=THREE.RepeatWrapping;t.colorSpace=THREE.SRGBColorSpace;return t;};
   const mkData=cv=>{const t=new THREE.CanvasTexture(cv);   // linear data map
     t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;};
-  return {map:mk(a),emissiveMap:mk(e),specMap:mkData(sMapC)};
+  return {map:mk(a),emissiveMap:mk(e),specMap:mkData(sMapC),
+          eCanvas:e,panes,lit};   // live handles for the night pane animation
 }
+// per-family glass look: tint, polish, reflection strength
+const GLASS_PARAMS={
+  0:{color:0xd6ecf7,rough:0.12,metal:0.88,env:1.6},   // cool-blue curtain
+  3:{color:0xbfe4d2,rough:0.14,metal:0.85,env:1.5},   // emerald
+  4:{color:0x9a8b74,rough:0.18,metal:0.80,env:1.4},   // bronze/smoked
+  5:{color:0xe9eef2,rough:0.07,metal:0.95,env:1.9}};  // silver mirror
 function buildSharedMaterials(){
-  wallMats=[];
-  for(let s=0;s<3;s++){
-    const tx=buildFacadeTexture(s, s===0?0.55:0.42);
-    // style 0 = glass curtain-wall: whole facade glossy with a cool glass
-    // tint. Styles 1-2 (masonry/concrete): the combined G/B spec map makes
+  wallMats=[]; facadeAnim=[];
+  for(let s=0;s<6;s++){
+    const tx=buildFacadeTexture(s, GLASS_STYLES.has(s)?0.55:0.42);
+    // Glass families (0/3/4/5): whole facade glossy with the family tint.
+    // Styles 1-2 (masonry/concrete): the combined G/B spec map makes
     // each WINDOW pane smooth+metallic (real glass under the PMREM sky)
     // while walls stay matte.
+    const gp=GLASS_PARAMS[s];
     const m=new THREE.MeshStandardMaterial({
       map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xffbe6a),
       emissiveIntensity:0, vertexColors:true,
-      ...(s===0
-        ? {roughness:0.12, metalness:0.88, envMapIntensity:1.6,
-           color:new THREE.Color(0xd6ecf7)}
+      ...(gp
+        ? {roughness:gp.rough, metalness:gp.metal, envMapIntensity:gp.env,
+           color:new THREE.Color(gp.color)}
         : {roughness:1, metalness:1,
            roughnessMap:tx.specMap, metalnessMap:tx.specMap,
            envMapIntensity:0.9})
     });
     wallMats.push(m);
+    facadeAnim.push({canvas:tx.eCanvas,panes:tx.panes,lit:tx.lit,tex:m.emissiveMap});
   }
   matRoadMajor=new THREE.MeshStandardMaterial({color:0x14161c,emissive:0x66d9ff,
     emissiveIntensity:0.05,roughness:.9,transparent:true,opacity:.92,side:THREE.DoubleSide});
@@ -1505,7 +1545,8 @@ function buildBuildings(osm){
     // large-footprint buildings (malls/offices); masonry/concrete for
     // the rest - photo facades override this later
     const variant=pickFacadeVariant(h,p.area,p.rand());
-    const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
+    const matIdx=variant===0?pickGlassStyle(h,p.rand()):variant;   // glass family
+    const mesh=new THREE.Mesh(geom,[roofMat,wallMats[matIdx]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
     mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
       area:Math.round(p.area),
@@ -2957,6 +2998,7 @@ function applyAtmosphere(){
 
   const day=clamp(elev*2.2,0,1);
   const night=clamp((0.12-elev)*4,0,1);
+  nightNow=night;                       // read by the facade pane animation
   dirLight.intensity=2.9*day;
   dirLight.color.setHSL(0.09,clamp(0.9-elev*1.4,0,0.8),0.72+0.2*day);
   hemiLight.intensity=0.08+0.55*day;
@@ -2991,6 +3033,43 @@ function applyAtmosphere(){
   bloomPass.strength=0.12+night*0.75+fogAmt*0.55;
   bloomPass.radius=0.25+fogAmt*0.5;
 }
+/* ---- night facade life ----
+   At night, individual window panes flick on and off at random: one
+   facade family's emissive canvas is repainted per tick (round-robin,
+   ~0.45s), so every family's panes twinkle every ~2.7s. Materials are
+   shared per family, so a pane change ripples across the towers wearing
+   that family - reads as scattered, living windows at street distance,
+   for the cost of one small texture upload per tick. */
+function facadeGlowTick(dt){
+  if(nightNow<0.15||!facadeAnim.length) return;
+  facadeTickT+=dt;
+  if(facadeTickT<0.45) return;
+  facadeTickT=0;
+  const fa=facadeAnim[facadeTickI++%facadeAnim.length];
+  if(!fa.panes.length) return;
+  const ctx=fa.canvas.getContext('2d');
+  pickPaneFlips(fa.panes.length,3+Math.floor(Math.random()*3),Math.random).forEach(i=>{
+    const p=fa.panes[i];
+    if(fa.lit.has(i)){ fa.lit.delete(i); ctx.fillStyle='#000'; }
+    else{
+      fa.lit.add(i);
+      ctx.fillStyle=Math.random()>.35
+        ?`rgba(255,${190+Math.random()*50|0},110,1)`   // warm interior
+        :'rgba(180,215,255,1)';                        // cool office
+    }
+    ctx.fillRect(p.x,p.y,p.w,p.h);
+  });
+  fa.tex.needsUpdate=true;
+}
+// read-only debug hooks (used by automated verification, like
+// __atlasTrafficSample): facade family usage + glow animation state
+window.__atlasFacadeStats=()=>{ const c={};
+  cityGroup.children.concat(synGroup.children).forEach(m=>{
+    const i=wallMats.indexOf(Array.isArray(m.material)?m.material[1]:m.material);
+    if(i>=0) c[i]=(c[i]||0)+1; });
+  return c; };
+window.__atlasGlowState=()=>facadeAnim.map(f=>f.lit.size);
+window.__atlasGlowTick=dt=>facadeGlowTick(dt);
 $('timeSlider').addEventListener('input',()=>{ timeAnim=null; applyAtmosphere(); });
 // time-of-day presets: glide the clock instead of jumping, so the sky,
 // lights and reflections are seen transitioning
@@ -4239,7 +4318,7 @@ function animate(){
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt); updateNav(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt); updateNav(dt); facadeGlowTick(dt);
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
