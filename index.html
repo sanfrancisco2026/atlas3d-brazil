@@ -1349,6 +1349,32 @@ function buildShadowModel(prepared,lum){
            elevDeg:Math.atan(k)*180/Math.PI, lum };
 }
 
+// Pure (unit-tested): ray-cast point-in-polygon on {x,y} rings
+function pointInPoly(poly,x,y){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const a=poly[i],b=poly[j];
+    if((a.y>y)!==(b.y>y)&&x<(b.x-a.x)*(y-a.y)/(b.y-a.y)+a.x) inside=!inside;
+  }
+  return inside;
+}
+// Pure (unit-tested): min distance from a point to the ring's edges
+function distToPolyEdge(poly,x,y){
+  let m=Infinity;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const a=poly[i],b=poly[j];
+    const dx=b.x-a.x,dy=b.y-a.y,L2=dx*dx+dy*dy;
+    const t=L2?clamp(((x-a.x)*dx+(y-a.y)*dy)/L2,0,1):0;
+    m=Math.min(m,Math.hypot(x-(a.x+dx*t),y-(a.y+dy*t)));
+  }
+  return m;
+}
+// Pure (unit-tested): does a footprint ring overlap any road-corridor sample
+// (centreline point + that road's half-width)?
+function footprintOnRoad(poly,samples){
+  return samples.some(s=>pointInPoly(poly,s.x,s.y)||distToPolyEdge(poly,s.x,s.y)<s.hw);
+}
+
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
   pollutionCtx.stacks=[]; pollutionCtx.indArea=0;
@@ -1356,6 +1382,40 @@ function buildBuildings(osm){
   const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
   const halfW=sceneW/2, halfH=sceneH/2;
   const feet=collectBuildingFootprints(osm);
+
+  // Drivable-road corridor samples (4m spacing, spatial-hashed): synthetic
+  // infill must never sit on a road, or traffic would appear to drive
+  // straight through buildings. Real OSM/ML footprints are trusted as-is.
+  const RS_CELL=14, rsMap=new Map();
+  osm.elements.forEach(el=>{
+    if(el.type!=='way'||!el.tags||!DRIVABLE.has(el.tags.highway)) return;
+    const hw=ROAD_CLASS[el.tags.highway][0]/2+0.3;
+    const rp=[];
+    el.nodes.forEach(nid=>{ const nd=osm.nodesById[nid]; if(nd)
+      rp.push({x:(nd.lon-cLon)*mPerLon, y:(cLat-nd.lat)*M_LAT}); });
+    for(let i=0;i<rp.length-1;i++){
+      const dx=rp[i+1].x-rp[i].x, dy=rp[i+1].y-rp[i].y, L=Math.hypot(dx,dy)||1;
+      for(let d=0;;d+=4){                 // sample includes the endpoint
+        const dd=Math.min(d,L);
+        const s={x:rp[i].x+dx*dd/L, y:rp[i].y+dy*dd/L, hw};
+        const k=Math.round(s.x/RS_CELL)+','+Math.round(s.y/RS_CELL);
+        if(!rsMap.has(k)) rsMap.set(k,[]);
+        rsMap.get(k).push(s);
+        if(dd>=L) break;
+      }
+    }
+  });
+  const roadSamplesNear=poly=>{
+    let x0=1/0,x1=-1/0,y0=1/0,y1=-1/0;
+    poly.forEach(p=>{ x0=Math.min(x0,p.x); x1=Math.max(x1,p.x);
+                      y0=Math.min(y0,p.y); y1=Math.max(y1,p.y); });
+    const out=[];
+    for(let cx=Math.round((x0-8)/RS_CELL);cx<=Math.round((x1+8)/RS_CELL);cx++)
+      for(let cy=Math.round((y0-8)/RS_CELL);cy<=Math.round((y1+8)/RS_CELL);cy++){
+        const l=rsMap.get(cx+','+cy); if(l) out.push(...l);
+      }
+    return out;
+  };
 
   // ---- pass 1: geometry, centroid, area, first-guess (typology) height ----
   const prepared=[];
@@ -1404,8 +1464,9 @@ function buildBuildings(osm){
   }
 
   // ---- pass 2: extrude ----
-  let count=0, tallest=0, tagged=0, synCount=0;
+  let count=0, tallest=0, tagged=0, synCount=0, synDropped=0;
   prepared.forEach(p=>{
+    if(p.isSyn&&footprintOnRoad(p.pts,roadSamplesNear(p.pts))){ synDropped++; return; }
     const h=p.finalH||p.typologyH;
     const minH=clamp(p.minH,0,h-1);
     if(p.tagged) tagged++;
@@ -1477,6 +1538,7 @@ function buildBuildings(osm){
   $('synBtn').style.display=synCount?'block':'none';
   log(`Extruded ${real} real footprints (${tagged} OSM z-tagged`+(refined?`, ${refined} shadow-estimated`:'')+`)`,'ok');
   if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (procedural, landuse-derived)`,'ai');
+  if(synDropped) log(`- ${synDropped} synthetic footprints dropped (overlapped a road corridor)`,'ai');
 }
 
 /* ---- roads as glowing ribbons + traffic paths ---- */
@@ -1531,7 +1593,7 @@ function buildRoads(osm){
       // cumulative distances for traffic animation
       const cum=[0]; for(let i=0;i<pts.length-1;i++)
         cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
-      trafficPaths.push({pts,cum,total:len,major});   // buses stick to major roads
+      trafficPaths.push({pts,cum,total:len,major,hw:cls[0]/2});   // buses stick to major roads
     }
     if(el.tags.name&&len>60&&(major||len>120))
       namedRoads.push({name:el.tags.name,pts,len,major});
@@ -1778,6 +1840,10 @@ function pickPaint(){
   for(const [c,w] of VEH_PAINT){ if((r-=w)<=0) return c; }
   return 0xf2f2f2;
 }
+// Pure (unit-tested): pull the lane offset inward so the wheel track stays
+// on the carriageway - on narrow streets (service/living) vehicles hug the
+// centreline instead of riding the verge through buildings and parks.
+function laneClamp(lane,halfW){ return Math.min(lane,Math.max(0.4,halfW-0.9)); }
 // Right-hand lane offset, pure (unit-tested): facing = path yaw flipped when
 // travelling the way backwards; right vector = facing rotated -90deg about Y.
 function laneOffset(yaw,dir,laneW){
@@ -2033,7 +2099,7 @@ function updateTraffic(dt){
     }
     const p=pointOnPath(trafficPaths[c.pi],c.d);
     const face=p.yaw+(c.dir<0?Math.PI:0);
-    const lo=laneOffset(p.yaw,c.dir,c.lane);
+    const lo=laneOffset(p.yaw,c.dir,laneClamp(c.lane,trafficPaths[c.pi].hw||2.5));
     _ce.set(0,face,0);
     _cq.setFromEuler(_ce);
     _cm.compose(_cp.set(p.x+lo.ox,0.02,p.z+lo.oz),_cq,_cs);
