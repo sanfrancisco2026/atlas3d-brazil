@@ -1128,10 +1128,24 @@ function initThree(){
 }
 
 /* ---- procedural facade textures (albedo + emissive night windows) ---- */
+// Pure (unit-tested): facade variant - 0 glass curtain, 1 masonry, 2 concrete.
+// Glass goes to towers (>55m), a share of mid-rises (>38m), and
+// large-footprint buildings (malls/offices >2500m2 above 12m).
+function pickFacadeVariant(h,area,r){
+  if(h>55||(h>38&&r<0.35)) return 0;
+  if(area>2500&&h>12&&r<0.7) return 0;
+  return r>0.5?1:2;
+}
 function buildFacadeTexture(style,litRatio){
   const W=256,H=512;
   const a=document.createElement('canvas'); a.width=W; a.height=H;
   const e=document.createElement('canvas'); e.width=W; e.height=H;
+  // combined PBR map: G channel = roughness, B channel = metalness.
+  // Walls rough/non-metal; window panes smooth/metallic, so with the
+  // PMREM sky environment every window reads as real glass.
+  const sMapC=document.createElement('canvas'); sMapC.width=W; sMapC.height=H;
+  const sx=sMapC.getContext('2d');
+  sx.fillStyle='rgb(0,235,8)'; sx.fillRect(0,0,W,H);
   const ax=a.getContext('2d'), ex=e.getContext('2d');
   ax.fillStyle='#b9b9bc'; ax.fillRect(0,0,W,H);
   ex.fillStyle='#000'; ex.fillRect(0,0,W,H);
@@ -1150,6 +1164,7 @@ function buildFacadeTexture(style,litRatio){
     ax.fillStyle=`rgb(${shade},${shade+8},${shade+20})`;
     ax.fillRect(wx,wy,ww,wh);
     ax.strokeStyle='rgba(255,255,255,.25)'; ax.lineWidth=1.5; ax.strokeRect(wx,wy,ww,wh);
+    sx.fillStyle='rgb(0,45,185)'; sx.fillRect(wx,wy,ww,wh);   // pane: smooth + metallic
     if(rand()<litRatio){
       const warm=rand();
       ex.fillStyle=warm>.35?`rgba(255,${190+rand()*50|0},110,1)`:'rgba(180,215,255,1)';
@@ -1163,19 +1178,27 @@ function buildFacadeTexture(style,litRatio){
   }
   const mk=cv=>{const t=new THREE.CanvasTexture(cv);
     t.wrapS=t.wrapT=THREE.RepeatWrapping;t.colorSpace=THREE.SRGBColorSpace;return t;};
-  return {map:mk(a),emissiveMap:mk(e)};
+  const mkData=cv=>{const t=new THREE.CanvasTexture(cv);   // linear data map
+    t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;};
+  return {map:mk(a),emissiveMap:mk(e),specMap:mkData(sMapC)};
 }
 function buildSharedMaterials(){
   wallMats=[];
   for(let s=0;s<3;s++){
     const tx=buildFacadeTexture(s, s===0?0.55:0.42);
-    // style 0 is the glass curtain-wall: tuned glossy so the PMREM sky
-    // environment reads as real glazing on towers without photo data
+    // style 0 = glass curtain-wall: whole facade glossy with a cool glass
+    // tint. Styles 1-2 (masonry/concrete): the combined G/B spec map makes
+    // each WINDOW pane smooth+metallic (real glass under the PMREM sky)
+    // while walls stay matte.
     const m=new THREE.MeshStandardMaterial({
       map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xffbe6a),
       emissiveIntensity:0, vertexColors:true,
-      roughness:s===0?0.14:0.85, metalness:s===0?0.85:0.05,
-      envMapIntensity:s===0?1.5:0.25
+      ...(s===0
+        ? {roughness:0.12, metalness:0.88, envMapIntensity:1.6,
+           color:new THREE.Color(0xd6ecf7)}
+        : {roughness:1, metalness:1,
+           roughnessMap:tx.specMap, metalnessMap:tx.specMap,
+           envMapIntensity:0.9})
     });
     wallMats.push(m);
   }
@@ -1417,11 +1440,10 @@ function buildBuildings(osm){
       if(L2>bestE){ bestE=L2; facadeAz=((Math.atan2(dx,-dy)*180/Math.PI)+360)%180; }
     }
 
-    // material variant: glazed glass for towers (and some mid-rises),
-    // masonry/concrete for the rest - photo facades override this later
-    let variant;
-    if(h>55||(h>38&&p.rand()<0.35)) variant=0;
-    else if(p.rand()>0.5) variant=1; else variant=2;
+    // material variant: glazed glass for towers, some mid-rises AND
+    // large-footprint buildings (malls/offices); masonry/concrete for
+    // the rest - photo facades override this later
+    const variant=pickFacadeVariant(h,p.area,p.rand());
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[variant]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
     mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
