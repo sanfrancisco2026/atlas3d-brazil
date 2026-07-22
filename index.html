@@ -401,6 +401,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <p class="hint" id="ibgeInfo"></p>
     <div class="slider-row" style="margin-top:10px"><span>Geo-datasets here (IBGE BDIA)</span><b></b></div>
     <p class="hint" id="geoSciInfo"></p>
+    <div class="slider-row" style="margin-top:10px"><span>Carbon credits (est.)</span><b id="carbonVal">&mdash;</b></div>
+    <p class="hint" id="carbonInfo"></p>
     <a id="g360Link" target="_blank" rel="noopener" style="display:none;text-align:center;
       text-decoration:none;padding:9px;border:1px solid #33405a;border-radius:7px;color:#93a3bc;
       font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;margin-top:6px">
@@ -520,6 +522,11 @@ let trailerMat = null, vehDetailMat = null, vehModelGrouped = {};
 const TRUCK_PAINT=[0xc23b3b,0x2b5fa8,0x2e7d46,0xd97a1a,0x555a63,0xe6e6e6];
 // trailer liveries: freight-white heavy, plus real fleet colours
 const TRAILER_PAINT=[0xf4f4f4,0xf4f4f4,0xdcdee2,0xb03030,0x2e5a9e,0x3a7d44,0xd9a70d];
+// bus tints multiply the baked Isuzu texture - light shades keep the
+// window/panel detail readable while varying the livery
+const BUS_PAINT=[0xffffff,0xfff0a8,0xffd9a8,0xcfe4ff,0xd4f2cc,0xffc9c9];
+// vans: classic Kombi-style fleet colours
+const VAN_PAINT=[0xf2f2f2,0x9fc7e8,0xd94f4f,0x7fb069,0xe8c34d,0xe8955f];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
@@ -527,6 +534,7 @@ let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
 let weatherState=null, rainSys=null, climCache=null, simData=null;
 let labelGroup=null;
+let greenStats=null, solarKwpTotal=0;
 let downXY = null;
 let prevT = performance.now();
 
@@ -1436,6 +1444,7 @@ function buildBuildings(osm){
   // zone-wide PV potential over real (OSM-mapped) roofs only
   let totKwp=0;
   cityGroup.children.forEach(m=>{ if(m.userData&&m.userData.area) totKwp+=solarPotential(m.userData.area).kwp; });
+  solarKwpTotal=totKwp;
   $('stSolar').textContent=real?fmtKwp(totKwp):'—';
   $('stSolar').title=`~${Math.round(totKwp*SOLAR.yieldKwhPerKwp/1000).toLocaleString()} MWh/year across ${real} mapped roofs (60% usable, 200Wp/m², est.)`;
   if(real) log(`Solar potential: ${fmtKwp(totKwp)} across ${real} mapped roofs (est.)`,'ai');
@@ -1793,10 +1802,12 @@ function buildTraffic(){
       cars.push({pi, d:Math.random()*trafficPaths[pi].total,
         v:t.vMin+Math.random()*(t.vMax-t.vMin),
         dir:Math.random()>.5?1:-1, ti, mi:i, lane:t.lane, mo:t.majorOnly});
-      if(t.key==='bus'&&vehModelMats.bus){ /* textured livery - no tint */ }
-      else mesh.setColorAt(i,col.setHex(
-        t.key==='bus'?0xd97a1a
-        : t.key==='truck'?TRUCK_PAINT[Math.floor(Math.random()*TRUCK_PAINT.length)]
+      const pal=t.key==='bus'?(vehModelMats.bus?BUS_PAINT:null)
+              : t.key==='van'?VAN_PAINT
+              : t.key==='truck'?TRUCK_PAINT:null;
+      mesh.setColorAt(i,col.setHex(
+        pal?pal[Math.floor(Math.random()*pal.length)]
+        : t.key==='bus'?0xd97a1a
         : pickPaint()));
     }
     if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
@@ -3473,6 +3484,8 @@ function buildGreenscape(){
   const m=new THREE.Mesh(new THREE.PlaneGeometry(sceneW,sceneH),
     new THREE.MeshBasicMaterial({map:t,transparent:true,depthWrite:false}));
   m.rotation.x=-Math.PI/2; m.position.y=0.38; PG('green').add(m);
+  let vegCount=0; for(let i=0;i<cells;i++) if(veg[i]) vegCount++;
+  greenStats={vegM2:vegCount/cells*sceneW*sceneH, potM2:pot/cells*sceneW*sceneH};
   const pct=Math.round(pot/cells*100);
   $('stGreen').textContent=pct+'%';
   $('stGreen').title=`${pct}% of ground cells are neither vegetated, built, nor road - candidates for parks/trees. Plus ${roofCandidates} large flat roofs suitable for green roofs.`;
@@ -3618,6 +3631,41 @@ function toggleCadastral(){
   log(`Cadastral layer: ${use.length} census-sector boundary segments, geo-located (IBGE 2022)`,'ok');
 }
 $('cadBtn').addEventListener('click',toggleCadastral);
+
+/* ============================================================
+   CARBON CREDITS (green cover + rooftop solar scenarios)
+   Sequestration from today's vegetation, the extra if all greenable
+   ground were planted, and avoided grid emissions from the zone's
+   rooftop-PV potential - shown as with/without-solar scenarios.
+   Assumptions are stated in the panel: mixed urban vegetation
+   ~0.30 kgCO2/m2/yr; grid factors 0.10 tCO2/MWh (Brazil, hydro-
+   heavy) vs 0.95 (South Africa, coal-heavy); 1 credit = 1 tCO2e/yr.
+============================================================ */
+const CARBON={vegKgPerM2:0.30, efBR:0.10, efZA:0.95};
+// Pure (unit-tested): grid emission factor by longitude (ZA is east)
+function gridEF(lon){ return lon>-20?CARBON.efZA:CARBON.efBR; }
+// Pure (unit-tested): tCO2e/yr for the scenarios
+function carbonCredits(vegM2,potM2,kwp,lon){
+  const r1=v=>Math.round(v*10)/10;
+  const green=Math.max(0,vegM2||0)*CARBON.vegKgPerM2/1000;
+  const greenPot=Math.max(0,potM2||0)*CARBON.vegKgPerM2/1000;
+  const solar=Math.max(0,kwp||0)*SOLAR.yieldKwhPerKwp/1000*gridEF(lon);
+  return {green:r1(green),greenPot:r1(greenPot),solar:r1(solar),
+          without:r1(green+greenPot),withSolar:r1(green+greenPot+solar)};
+}
+function applyCarbon(){
+  if(!greenStats||!geoCtx) return;
+  const c=carbonCredits(greenStats.vegM2,greenStats.potM2,solarKwpTotal,geoCtx.cLon);
+  $('carbonVal').textContent=c.withSolar+' t/yr';
+  $('carbonInfo').innerHTML=
+    `Green cover today: ~${c.green} tCO2/yr · if all greenable ground planted: +${c.greenPot}`+
+    ` · rooftop solar: +${c.solar} (grid ${gridEF(geoCtx.cLon)} t/MWh)<br>`+
+    `<b>Without rooftop solar:</b> ${c.without} credits/yr · `+
+    `<b>with rooftop solar:</b> ${c.withSolar} credits/yr `+
+    `(1 credit = 1 tCO2e; vegetation ${CARBON.vegKgPerM2} kg/m²/yr est.)`;
+  log(`Carbon credits (est.): ${c.without} t/yr without rooftop solar, `+
+      `${c.withSolar} t/yr with (${c.solar} from PV)`,'ai');
+}
 
 /* ============================================================
    SIMULATED INFRASTRUCTURE LAYERS
@@ -3945,6 +3993,7 @@ $('buildBtn').addEventListener('click',async()=>{
     // planner overlays + optional photo facades (async, non-blocking)
     plannerClear();
     buildGreenscape();          // after the clear, or it would be wiped
+    applyCarbon();              // needs greenStats + solar total
     buildPlannerLayers(b);
     applyObliqueFacades(b);
     applyAirQuality(b);
@@ -3986,6 +4035,8 @@ $('resetBtn').addEventListener('click',()=>{
   $('simWrap').style.display='none';
   $('ibgeInfo').textContent=''; $('g360Link').style.display='none';
   $('geoSciInfo').textContent='';
+  greenStats=null; solarKwpTotal=0;
+  $('carbonVal').innerHTML='&mdash;'; $('carbonInfo').textContent='';
   scene.environment=null; if(envRT){ envRT.dispose(); envRT=null; }
   if(groundMesh){ scene.remove(groundMesh); groundMesh=null; }
   controls.autoRotate=false;
