@@ -1155,12 +1155,34 @@ function pickPaneFlips(n,k,rand){
   while(s.size<k&&guard-->0) s.add(Math.floor(rand()*n));
   return [...s];
 }
+// Pure (unit-tested): per-window dressing decisions for the facade painter.
+// Glass towers get dark mullion frames + occasional blinds/reflection
+// streaks; masonry/concrete get light frames, sills, curtains/blinds and
+// the odd window AC unit (masonry only - the Brazilian apartment look).
+function windowDressing(style,r,glassy){
+  if(glassy)
+    return {frame:'dark', interior:r<0.22?'blinds':'plain', streak:r>0.72,
+            sill:false, ac:false};
+  return {frame:'light',
+    interior:r<0.28?'blinds':r<0.52?'curtain':'plain', streak:false,
+    sill:true, ac:style===1&&r>0.9};
+}
+// Pure (unit-tested): median street-photo facade tone -> per-channel tint
+// for the procedural walls, so unphotographed buildings match the look of
+// the Mapillary-referenced ones. Needs >=2 photos; clamped so the city
+// never goes cartoonish. 135 = neutral facade luminance.
+function facadeRefTint(avgs){
+  if(!avgs||avgs.length<2) return null;
+  const med=k=>{ const v=avgs.map(a=>a[k]).sort((a,b)=>a-b); return v[v.length>>1]; };
+  const cc=v=>clamp(v/135,0.82,1.18);
+  return [cc(med(0)),cc(med(1)),cc(med(2))];
+}
 // Facade families: 0 cool-blue curtain, 1 punched masonry, 2 concrete
 // band, 3 emerald curtain, 4 bronze/smoked curtain, 5 silver-mirror
 // ribbon glazing. 0/3/4/5 are the glazed-glass exteriors.
 const GLASS_STYLES=new Set([0,3,4,5]);
 function buildFacadeTexture(style,litRatio){
-  const W=256,H=512;
+  const W=512,H=1024;   // doubled: room for frames, sills, blinds, mullions
   const a=document.createElement('canvas'); a.width=W; a.height=H;
   const e=document.createElement('canvas'); e.width=W; e.height=H;
   // combined PBR map: G channel = roughness, B channel = metalness.
@@ -1170,42 +1192,85 @@ function buildFacadeTexture(style,litRatio){
   const sx=sMapC.getContext('2d');
   sx.fillStyle='rgb(0,235,8)'; sx.fillRect(0,0,W,H);
   const ax=a.getContext('2d'), ex=e.getContext('2d');
+  const glassy=GLASS_STYLES.has(style);
   ax.fillStyle=style===5?'#c8ced4':style===4?'#8f887c':'#b9b9bc';   // mullion/base
   ax.fillRect(0,0,W,H);
   ex.fillStyle='#000'; ex.fillRect(0,0,W,H);
   const rand=mulberry32(style*991+7);
   // subtle facade noise
-  for(let i=0;i<900;i++){ ax.fillStyle=`rgba(0,0,0,${rand()*0.06})`;
-    ax.fillRect(rand()*W,rand()*H,rand()*30,rand()*8); }
+  for(let i=0;i<1800;i++){ ax.fillStyle=`rgba(0,0,0,${rand()*0.06})`;
+    ax.fillRect(rand()*W,rand()*H,rand()*60,rand()*16); }
   const cols=4, rows=8, cw=W/cols, rh=H/rows;
+  // wall treatment BEFORE the windows (the old order multiplied the brick
+  // tint over the finished panes and browned every window)
+  if(style===1){ // brick tint + faint courses
+    ax.globalCompositeOperation='multiply';
+    ax.fillStyle='#c9a288'; ax.fillRect(0,0,W,H);
+    ax.globalCompositeOperation='source-over';
+    ax.fillStyle='rgba(0,0,0,0.05)';
+    for(let yy=0;yy<H;yy+=9) ax.fillRect(0,yy,W,1);
+  }
+  if(style===2){ // precast panel joints
+    ax.fillStyle='rgba(0,0,0,0.14)';
+    for(let c=0;c<=cols;c++) ax.fillRect(c*cw-1,0,2,H);
+    for(let r=0;r<=rows;r++) ax.fillRect(0,r*rh-1,W,2);
+  }
+  // per-style glass tone at brightness v
+  const tone=v=>{ v=Math.round(v);
+    return style===3?`rgb(${Math.max(0,v-8)},${v+16},${v+10})`     // emerald
+         :style===4?`rgb(${v+16},${v+6},${Math.max(0,v-6)})`       // bronze
+         :style===5?`rgb(${v+6},${v+10},${v+16})`                  // silver
+         :`rgb(${v},${v+8},${v+20})`; };                           // cool blue
   const panes=[], lit=new Set();
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
     const x=c*cw, y=r*rh;
     let wx,wy,ww,wh;
-    if(style===5){ wx=x+1.5; wy=y+4; ww=cw-3; wh=rh*0.55; }     // ribbon band + spandrel
-    else if(GLASS_STYLES.has(style)){ wx=x+3; wy=y+6; ww=cw-6; wh=rh-14; } // glass curtain
+    if(style===5){ wx=x+3; wy=y+8; ww=cw-6; wh=rh*0.55; }       // ribbon band + spandrel
+    else if(glassy){ wx=x+6; wy=y+12; ww=cw-12; wh=rh-28; }     // glass curtain
     else if(style===1){ wx=x+cw*.22; wy=y+rh*.18; ww=cw*.56; wh=rh*.6; } // punched masonry
     else { wx=x+cw*.12; wy=y+rh*.3; ww=cw*.76; wh=rh*.42; }     // concrete band
+    const d=windowDressing(style,rand(),glassy);
+    // frame: recessed light surround (masonry/concrete) or dark mullion box
+    if(d.frame==='light'){ ax.fillStyle='#d8d3c9'; ax.fillRect(wx-4,wy-4,ww+8,wh+8);
+      ax.fillStyle='rgba(0,0,0,0.28)'; ax.fillRect(wx-1.5,wy-1.5,ww+3,wh+3); }
+    else{ ax.fillStyle='#22262c'; ax.fillRect(wx-3,wy-3,ww+6,wh+6); }
+    // glass: sky-reflection gradient, lighter at the head, darker at the base
     const shade=style===4?24+rand()*34:style===5?42+rand()*46:30+rand()*40;
-    ax.fillStyle=style===3?`rgb(${Math.max(0,shade-8)},${shade+16},${shade+10})`  // emerald
-               :style===4?`rgb(${shade+16},${shade+6},${Math.max(0,shade-6)})`    // bronze
-               :style===5?`rgb(${shade+6},${shade+10},${shade+16})`               // silver
-               :`rgb(${shade},${shade+8},${shade+20})`;                           // cool blue
-    ax.fillRect(wx,wy,ww,wh);
-    ax.strokeStyle='rgba(255,255,255,.25)'; ax.lineWidth=1.5; ax.strokeRect(wx,wy,ww,wh);
+    const gr=ax.createLinearGradient(0,wy,0,wy+wh);
+    gr.addColorStop(0,tone(shade+26)); gr.addColorStop(0.45,tone(shade+6));
+    gr.addColorStop(1,tone(Math.max(0,shade-8)));
+    ax.fillStyle=gr; ax.fillRect(wx,wy,ww,wh);
+    // interior life behind the glass
+    if(d.interior==='blinds'){ ax.fillStyle='rgba(226,220,205,0.85)';
+      const drop=wh*(0.3+rand()*0.5);
+      for(let yy=wy+3;yy<wy+drop;yy+=6) ax.fillRect(wx+2,yy,ww-4,3); }
+    else if(d.interior==='curtain'){ ax.fillStyle='rgba(214,206,190,0.75)';
+      const cwd=ww*(0.12+rand()*0.12);
+      ax.fillRect(wx+2,wy+2,cwd,wh-4); ax.fillRect(wx+ww-2-cwd,wy+2,cwd,wh-4); }
+    // diagonal reflection streak on a share of tower panes
+    if(d.streak){ const sg=ax.createLinearGradient(wx,wy+wh,wx+ww,wy);
+      sg.addColorStop(0.35,'rgba(255,255,255,0)');
+      sg.addColorStop(0.5,'rgba(255,255,255,0.16)');
+      sg.addColorStop(0.65,'rgba(255,255,255,0)');
+      ax.fillStyle=sg; ax.fillRect(wx,wy,ww,wh); }
+    // mullions / glazing bars
+    ax.fillStyle=d.frame==='light'?'rgba(233,229,220,0.9)':'rgba(30,34,40,0.8)';
+    if(style===5){ for(let k=1;k<4;k++) ax.fillRect(wx+ww*k/4-1.5,wy,3,wh); }
+    else if(glassy){ ax.fillRect(wx+ww/2-1.5,wy,3,wh); }
+    else{ ax.fillRect(wx+ww/2-1.5,wy,3,wh); ax.fillRect(wx,wy+wh*0.38-1.5,ww,3); }
+    // sill + drop shadow, and the odd window AC unit
+    if(d.sill){ ax.fillStyle='#cfc9bd'; ax.fillRect(wx-4,wy+wh,ww+8,5);
+      ax.fillStyle='rgba(0,0,0,0.25)'; ax.fillRect(wx-4,wy+wh+5,ww+8,4); }
+    if(d.ac){ ax.fillStyle='#9aa0a6'; ax.fillRect(wx+ww-20,wy+wh-10,18,12);
+      ax.fillStyle='rgba(0,0,0,0.35)'; ax.fillRect(wx+ww-20,wy+wh-10,18,3); }
     sx.fillStyle='rgb(0,45,185)'; sx.fillRect(wx,wy,ww,wh);   // pane: smooth + metallic
-    panes.push({x:wx+1,y:wy+1,w:ww-2,h:wh-2});
+    panes.push({x:wx+2,y:wy+2,w:ww-4,h:wh-4});
     if(rand()<litRatio){
       const warm=rand();
       ex.fillStyle=warm>.35?`rgba(255,${190+rand()*50|0},110,1)`:'rgba(180,215,255,1)';
-      ex.fillRect(wx+1,wy+1,ww-2,wh-2);
+      ex.fillRect(wx+2,wy+2,ww-4,wh-4);
       lit.add(panes.length-1);
     }
-  }
-  if(style===1){ // brick tint
-    ax.globalCompositeOperation='multiply';
-    ax.fillStyle='#c9a288'; ax.fillRect(0,0,W,H);
-    ax.globalCompositeOperation='source-over';
   }
   const mk=cv=>{const t=new THREE.CanvasTexture(cv);
     t.wrapS=t.wrapT=THREE.RepeatWrapping;t.colorSpace=THREE.SRGBColorSpace;return t;};
@@ -1230,7 +1295,9 @@ function buildSharedMaterials(){
     // while walls stay matte.
     const gp=GLASS_PARAMS[s];
     const m=new THREE.MeshStandardMaterial({
-      map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xffbe6a),
+      // soft warm-white emissive base: the map's warm/cool pane colours
+      // read true instead of being pushed to brown-orange
+      map:tx.map, emissiveMap:tx.emissiveMap, emissive:new THREE.Color(0xfff0dc),
       emissiveIntensity:0, vertexColors:true,
       ...(gp
         ? {roughness:gp.rough, metalness:gp.metal, envMapIntensity:gp.env,
@@ -1417,6 +1484,8 @@ function footprintOnRoad(poly,samples){
 
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
+  // reset any Mapillary-reference tint from the previous zone
+  [1,2].forEach(i=>{ if(wallMats[i]) wallMats[i].color.setRGB(1,1,1); });
   pollutionCtx.stacks=[]; pollutionCtx.indArea=0;
   const roofMat=new THREE.MeshStandardMaterial({map:satData.texture,roughness:.8,metalness:.05});
   const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
@@ -4120,10 +4189,11 @@ function photoSatTint(tex,lat,lon){
     if(b>r+18&&b>g+8&&lum>150) return null;        // mostly open sky, not a facade
     const sat=satPixel(lat,lon);                    // mosaic colour 0..1
     const cc=ch=>clamp(ch,0.72,1.35);
-    return new THREE.Color(cc(sat.r*255/Math.max(r,8)),
-                           cc(sat.g*255/Math.max(g,8)),
-                           cc(sat.b*255/Math.max(b,8)));
-  }catch(e){ return new THREE.Color(1,1,1); }       // tainted canvas: apply as-is
+    return {tint:new THREE.Color(cc(sat.r*255/Math.max(r,8)),
+                                 cc(sat.g*255/Math.max(g,8)),
+                                 cc(sat.b*255/Math.max(b,8))),
+            avg:[r,g,b]};                           // photo facade tone (reference)
+  }catch(e){ return {tint:new THREE.Color(1,1,1),avg:null}; } // tainted: apply as-is
 }
 async function applyObliqueFacades(b){
   const tok=$('mapToken').value.trim(); if(!tok) return;
@@ -4144,7 +4214,7 @@ async function applyObliqueFacades(b){
     const cands=cityGroup.children.filter(m=>m.userData&&m.userData.h)
       .sort((a,c)=>c.userData.h-a.userData.h).slice(0,40);
     const loader=new THREE.TextureLoader(); loader.setCrossOrigin('anonymous');
-    let applied=0, skyRejected=0; const used=new Map();
+    let applied=0, skyRejected=0; const used=new Map(), refAvgs=[];
     for(const m of cands){
       let best=null,bs=0.55;                        // quality gate
       for(const ph of imgs){
@@ -4157,17 +4227,26 @@ async function applyObliqueFacades(b){
         const tex=await new Promise((ok,no)=>loader.load(best.url,ok,undefined,no));
         tex.colorSpace=THREE.SRGBColorSpace;
         tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
-        const tint=photoSatTint(tex,m.userData.lat,m.userData.lon);
-        if(!tint){ skyRejected++; continue; }
+        const ps=photoSatTint(tex,m.userData.lat,m.userData.lon);
+        if(!ps){ skyRejected++; continue; }
         m.material=[m.material[0],
-          new THREE.MeshStandardMaterial({map:tex,color:tint,roughness:.85,metalness:.05})];
+          new THREE.MeshStandardMaterial({map:tex,color:ps.tint,roughness:.85,metalness:.05})];
         used.set(best,(used.get(best)||0)+1);
+        if(ps.avg) refAvgs.push(ps.avg);
         applied++;
       }catch(e){/* CORS or dead thumb - skip */}
     }
     log(`Mapillary: oriented photo facades on ${applied} buildings`+
       (skyRejected?` (${skyRejected} sky-shots rejected via satellite cross-check)`:''),
       applied?'ok':'err');
+    // use the street photos as a REFERENCE for everyone else: tint the
+    // procedural masonry/concrete walls toward the median photo tone so
+    // unphotographed buildings wear the same local look
+    const ref=facadeRefTint(refAvgs);
+    if(ref){
+      [1,2].forEach(i=>{ if(wallMats[i]) wallMats[i].color.setRGB(ref[0],ref[1],ref[2]); });
+      log(`Mapillary reference: procedural facades tinted toward ${refAvgs.length} street photos`,'ai');
+    }
   }catch(err){ log('Mapillary: '+err.message,'err'); }
 }
 
