@@ -518,6 +518,8 @@ let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {}, vehMode
 let trailerMat = null, vehDetailMat = null, vehModelGrouped = {};
 // truck cab liveries (trailers stay freight white)
 const TRUCK_PAINT=[0xc23b3b,0x2b5fa8,0x2e7d46,0xd97a1a,0x555a63,0xe6e6e6];
+// trailer liveries: freight-white heavy, plus real fleet colours
+const TRAILER_PAINT=[0xf4f4f4,0xf4f4f4,0xdcdee2,0xb03030,0x2e5a9e,0x3a7d44,0xd9a70d];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
@@ -1180,8 +1182,14 @@ function buildSharedMaterials(){
     metalness:.55,roughness:.4,emissive:0xfff6d8,emissiveIntensity:.35,
     side:THREE.DoubleSide}));
   wheelMat=new THREE.MeshStandardMaterial({color:0x17181c,roughness:.92,metalness:.1});
-  trailerMat=new THREE.MeshStandardMaterial({color:0xe8e8ea,roughness:.6,metalness:.25,
-    emissive:0xfff6d8,emissiveIntensity:.2,side:THREE.DoubleSide});
+  // white base so per-trailer liveries (setColorAt) show true
+  trailerMat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:.55,metalness:.2,
+    emissive:0xfff6d8,emissiveIntensity:.15});
+  // procedural trailer replaces the mesh-sliced GLB (whose decimated
+  // single-surface panels read as transparent): solid box + chassis
+  // rails + tandem wheels, grouped [paintable body, dark running gear]
+  vehModelGeos.truckTrailer=trailerGeometry();
+  vehModelGrouped.truckTrailer=true;
   // dark glass/wheels/trim bucket of two-material vehicle models; near-black
   // so per-instance body paint barely tints it, small emissive = night windows
   vehDetailMat=new THREE.MeshStandardMaterial({color:0x101216,roughness:.35,
@@ -1657,6 +1665,26 @@ function laneOffset(yaw,dir,laneW){
   const face=yaw+(dir<0?Math.PI:0);
   return {ox:-Math.cos(face)*laneW, oz:Math.sin(face)*laneW};
 }
+// Procedural semi trailer in final rig orientation (cab leads +Z):
+// solid box body + chassis rails, landing gear, rear bar and tandem
+// wheels. Two groups: 0 = paintable body, 1 = dark running gear.
+function trailerGeometry(){
+  const body=[],dark=[];
+  const bx=new THREE.BoxGeometry(2.55,2.7,9.6); bx.translate(0,2.55,-2.3);
+  body.push(bx);
+  [-0.55,0.55].forEach(x=>{
+    const r=new THREE.BoxGeometry(0.16,0.3,8.4); r.translate(x,1.05,-2.3); dark.push(r);
+  });
+  const bar=new THREE.BoxGeometry(2.3,0.15,0.12); bar.translate(0,0.62,-7.0); dark.push(bar);
+  [-0.5,0.5].forEach(x=>{
+    const lg=new THREE.BoxGeometry(0.12,0.95,0.12); lg.translate(x,0.6,1.6); dark.push(lg);
+  });
+  [-4.7,-5.9].forEach(z=>[-0.95,0.95].forEach(x=>{
+    const w=new THREE.CylinderGeometry(0.45,0.45,0.32,10);
+    w.rotateZ(Math.PI/2); w.translate(x,0.45,z); dark.push(w);
+  }));
+  return mergeGeometries([mergeGeometries(body),mergeGeometries(dark)],true);
+}
 function vehicleGeometry(t){
   const body=mergeGeometries(t.boxes.map(([w,h,l,y,z])=>{
     const g=new THREE.BoxGeometry(w,h,l); g.translate(0,y,z); return g;
@@ -1681,8 +1709,7 @@ function vehicleGeometry(t){
   const loader=new GLTFLoader();
   [['car','models/car.glb'],['van','models/van.glb'],
    ['moto','models/moto.glb'],
-   ['bus','models/bus.glb'],['truck','models/truck.glb'],
-   ['truckTrailer','models/truck_trailer.glb']]
+   ['bus','models/bus.glb'],['truck','models/truck.glb']]
   .forEach(([key,url])=>loader.load(url,g=>{
     const parts=[];
     g.scene.traverse(o=>{ if(o.isMesh) parts.push(o); });
@@ -1705,7 +1732,7 @@ function vehicleGeometry(t){
       geo=mergeGeometries(cleaned,true);
       grouped=true;
     }
-    if(key==='truck'||key==='truckTrailer')
+    if(key==='truck')
       geo.rotateY(Math.PI);   // source rig faces -Z (drove backwards)
     if(key==='bus'&&mat&&mat.map){
       // the bus ships its baked livery/window texture - use it as-is
@@ -1750,7 +1777,12 @@ function buildTraffic(){
     // semi trucks tow a separate freight-white trailer that shares
     // each instance's matrix (so the cab can be painted independently)
     if(t.key==='truck'&&modelGeo&&vehModelGeos.truckTrailer){
-      const trailer=new THREE.InstancedMesh(vehModelGeos.truckTrailer,trailerMat,n);
+      const trailer=new THREE.InstancedMesh(vehModelGeos.truckTrailer,
+        [trailerMat,wheelMat],n);
+      for(let i=0;i<n;i++)
+        trailer.setColorAt(i,col.setHex(
+          TRAILER_PAINT[Math.floor(Math.random()*TRAILER_PAINT.length)]));
+      if(trailer.instanceColor) trailer.instanceColor.needsUpdate=true;
       trailer.castShadow=true; trailer.userData.sharedGeo=true;
       mesh.userData.buddy=trailer; scene.add(trailer);
     }
