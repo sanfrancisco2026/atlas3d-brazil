@@ -970,9 +970,9 @@ function classifyGPU(s){
   return 'medium';
 }
 const GFX={
-  high:  {px:2,   shadow:4096, bloomDiv:1, rain:1,   traffic:190},
-  medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150},
-  low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90},
+  high:  {px:2,   shadow:4096, bloomDiv:1, rain:1,   traffic:190, veg:5000},
+  medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150, veg:3000},
+  low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90,  veg:1500},
 };
 // WebGL availability diagnostics. When both contexts are refused but the GPU
 // is healthy elsewhere, the usual culprit is a fingerprint-blocking extension
@@ -1625,34 +1625,122 @@ function buildRoadLabels(named){
 }
 
 /* ---- trees ---- */
-function buildTrees(osm){
-  clearGroup(treeGroup);
-  const {cLat,cLon,mPerLon}=geoCtx;
-  const spots=[];
-  osm.elements.forEach(el=>{
-    if(el.type==='node'&&el.tags&&el.tags.natural==='tree')
-      spots.push([(el.lon-cLon)*mPerLon,(cLat-el.lat)*M_LAT]);
-  });
-  const N=Math.min(spots.length,3500);
-  if(!N){ log('No mapped trees in this zone','ai'); return; }
-  const trunkG=new THREE.CylinderGeometry(0.22,0.34,2.4,5);
-  const crownG=new THREE.IcosahedronGeometry(1.7,1);
-  const trunkM=new THREE.MeshStandardMaterial({color:0x5a4630,roughness:1});
-  const crownM=new THREE.MeshStandardMaterial({color:0x3f7d3a,roughness:1});
-  const trunks=new THREE.InstancedMesh(trunkG,trunkM,N);
-  const crowns=new THREE.InstancedMesh(crownG,crownM,N);
-  const m=new THREE.Matrix4(), q=new THREE.Quaternion(), s=new THREE.Vector3();
-  const col=new THREE.Color();
-  for(let i=0;i<N;i++){
-    const [x,z]=spots[i]; const sc=0.8+Math.random()*0.9;
-    m.compose(new THREE.Vector3(x,1.2*sc,z),q,s.set(sc,sc,sc)); trunks.setMatrixAt(i,m);
-    m.compose(new THREE.Vector3(x,(2.4+1.2)*sc,z),q,s.set(sc,sc*(0.9+Math.random()*0.4),sc));
-    crowns.setMatrixAt(i,m);
-    crowns.setColorAt(i,col.setHSL(0.29+Math.random()*0.06,0.45,0.28+Math.random()*0.12));
+/* ---- natural vegetation ----
+   Grass tufts, shrubs and two tree forms scattered over the satellite
+   green mask (plus OSM-mapped trees), with heights taken from the SP
+   LiDAR grid where it exists and species/size biased by surroundings:
+   spots beside buildings get shade-tolerant shrubs, slightly smaller
+   and darker; open ground gets the occasional full tree. */
+// Pure (unit-tested): pick archetype + height from measured LiDAR height
+// (when available), building proximity, and a random roll.
+function vegArchetype(lidarH,nearB,r){
+  if(lidarH!=null&&lidarH>=3.5)
+    return {type:r<0.2?'cone':'tree',
+            h:clamp(lidarH,3.5,28)*(nearB?0.85:1), shade:!!nearB};
+  if(lidarH!=null&&lidarH>=1)
+    return {type:'shrub', h:clamp(lidarH,0.6,3), shade:!!nearB};
+  if(lidarH!=null&&lidarH>0)
+    return {type:'grass', h:0.3+r*0.25, shade:!!nearB};
+  if(nearB){                       // street trees line built-up blocks
+    if(r<0.12) return {type:'tree', h:4+r*25, shade:true};
+    return r<0.65?{type:'shrub',h:0.8+r*1.2,shade:true}
+                 :{type:'grass',h:0.3+r*0.2,shade:true};
   }
-  trunks.castShadow=crowns.castShadow=true;
-  treeGroup.add(trunks,crowns);
-  log(`Planted ${N} OSM-mapped trees`,'ok');
+  if(r<0.16) return {type:r<0.03?'cone':'tree', h:5+r*25, shade:false};
+  if(r<0.5)  return {type:'shrub', h:0.7+r*2, shade:false};
+  return {type:'grass', h:0.25+r*0.3, shade:false};
+}
+const VEG_UNIT={tree:1.0,cone:1.05,shrub:0.78,grass:0.53};
+function vegGeometries(){
+  const blob=(r,x,y,z,sy)=>{ const g=new THREE.IcosahedronGeometry(r,1);
+    g.scale(1,sy||1,1); g.translate(x,y,z); return g; };
+  // cylinders/cones are indexed, icosahedra are not - de-index so
+  // mergeGeometries accepts mixed parts
+  const trunkT=new THREE.CylinderGeometry(0.035,0.05,0.42,5).toNonIndexed();
+  trunkT.translate(0,0.21,0);
+  const treeCrown=mergeGeometries([blob(0.30,0,0.70,0,0.9),
+    blob(0.22,0.16,0.58,0.10,0.8), blob(0.20,-0.15,0.60,-0.08,0.85)]);
+  const tree=mergeGeometries([trunkT,treeCrown],true);            // [trunk, crown]
+  const trunkC=new THREE.CylinderGeometry(0.03,0.045,0.30,5).toNonIndexed();
+  trunkC.translate(0,0.15,0);
+  const coneCrown=new THREE.ConeGeometry(0.26,0.75,7).toNonIndexed();
+  coneCrown.translate(0,0.675,0);
+  const cone=mergeGeometries([trunkC,coneCrown],true);
+  const shrub=mergeGeometries([blob(0.42,0,0.42,0,0.85), blob(0.30,0.25,0.30,0.15,0.8)]);
+  const grass=blob(0.5,0,0.28,0,0.5);
+  return {tree,cone,shrub,grass};
+}
+function buildVegetation(osm){
+  clearGroup(treeGroup);
+  if(!geoCtx) return;
+  const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
+  const lidar=lidarAreaFor(cLat,cLon);
+  const rand=mulberry32(((Math.abs(cLat*8e4)|0)^(Math.abs(cLon*8e4)|0))>>>0);
+  const lidarAt=(x,z)=>{ if(!lidar) return null;
+    const ll=sceneToLatLon(x,z); return lidarHeightAt(lidar,ll.lat,ll.lon); };
+  const spots=[];
+  let osmTrees=0;
+  osm.elements.forEach(el=>{
+    if(el.type==='node'&&el.tags&&el.tags.natural==='tree'){
+      const x=(el.lon-cLon)*mPerLon, z=(cLat-el.lat)*M_LAT;
+      const lh=lidarAt(x,z), r=rand();
+      spots.push({x,z,arch:{type:r<0.15?'cone':'tree',
+        h:(lh&&lh>=3)?clamp(lh,4,28):5+r*4, shade:false}});
+      osmTrees++;
+    }
+  });
+  const cap=GFX[gfxTier].veg;
+  const G=greenStats;
+  if(G&&G.veg){
+    const N=GREEN_N, cw=sceneW/N, ch=sceneH/N;
+    for(let cy=0;cy<N&&spots.length<cap;cy++)
+    for(let cx=0;cx<N&&spots.length<cap;cx++){
+      const i=cy*N+cx;
+      if(!G.veg[i]||G.busy[i]) continue;
+      const nearB=[i-1,i+1,i-N,i+N,i-N-1,i-N+1,i+N-1,i+N+1]
+        .some(j=>j>=0&&j<N*N&&G.built[j]);
+      const density=rand();
+      const count=density<0.35?1:density<0.75?2:3;
+      for(let k=0;k<count&&spots.length<cap;k++){
+        const x=(cx+rand())*cw-sceneW/2, z=(cy+rand())*ch-sceneH/2;
+        spots.push({x,z,arch:vegArchetype(lidarAt(x,z),nearB,rand())});
+      }
+    }
+  }
+  if(!spots.length){ log('No vegetation detected in this zone','ai'); return; }
+  const byType={tree:[],cone:[],shrub:[],grass:[]};
+  spots.forEach(s=>byType[s.arch.type].push(s));
+  const geos=vegGeometries();
+  const trunkMat=new THREE.MeshStandardMaterial({color:0x5a4630,roughness:1});
+  const mm=new THREE.Matrix4(), qq=new THREE.Quaternion(), vv=new THREE.Vector3(),
+        ee=new THREE.Euler(), col=new THREE.Color();
+  let lidarScaled=0;
+  Object.entries(byType).forEach(([type,list])=>{
+    if(!list.length) return;
+    const crownMat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1});
+    const mat=(type==='tree'||type==='cone')?[trunkMat,crownMat]:crownMat;
+    const mesh=new THREE.InstancedMesh(geos[type],mat,list.length);
+    list.forEach((s,i)=>{
+      const sv=s.arch.h/VEG_UNIT[type];
+      const sh=sv*(0.75+rand()*0.5);
+      ee.set(0,rand()*Math.PI*2,0); qq.setFromEuler(ee);
+      mm.compose(vv.set(s.x,0,s.z),qq,new THREE.Vector3(sh,sv,sh));
+      mesh.setMatrixAt(i,mm);
+      const grassy=type==='grass';
+      col.setHSL(grassy?0.22+rand()*0.08:0.27+rand()*0.08,
+                 (grassy?0.5:0.45)*(s.arch.shade?0.85:1),
+                 (grassy?0.32:0.30+rand()*0.10)*(s.arch.shade?0.75:1));
+      mesh.setColorAt(i,col);
+      if(lidar&&s.arch.type!=='grass') lidarScaled++;
+    });
+    if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
+    mesh.castShadow=type!=='grass';
+    treeGroup.add(mesh);
+  });
+  log(`Vegetation: ${byType.tree.length+byType.cone.length} trees `+
+    `(${osmTrees} OSM-mapped), ${byType.shrub.length} shrubs, `+
+    `${byType.grass.length} grass tufts`+
+    (lidar?` - heights from PMSP LiDAR (${lidarScaled} scaled)`:''),'ok');
 }
 
 /* ---- ambient traffic ----
@@ -3007,9 +3095,13 @@ async function requestRoute(){
     const pts=r.geometry.coordinates.map(([lon,lat])=>
       new THREE.Vector3((lon-geoCtx.cLon)*geoCtx.mPerLon,1.6,(geoCtx.cLat-lat)*M_LAT));
     if(pts.length<2) throw new Error('degenerate route');
-    routeCurve=new THREE.CatmullRomCurve3(pts);
+    // exact polyline, NOT a Catmull-Rom spline: splines bulge between
+    // vertices and swing the tube off the carriageway at every bend
+    routeCurve=new THREE.CurvePath();
+    for(let i=0;i<pts.length-1;i++)
+      routeCurve.add(new THREE.LineCurve3(pts[i],pts[i+1]));
     const tube=new THREE.Mesh(
-      new THREE.TubeGeometry(routeCurve,Math.min(400,pts.length*4),1.4,8,false),
+      new THREE.TubeGeometry(routeCurve,Math.min(800,pts.length*2),1.4,8,false),
       new THREE.MeshStandardMaterial({color:0x003322,emissive:0x00ff9d,emissiveIntensity:1.6,
         transparent:true,opacity:.9}));
     routeGroup.add(tube);
@@ -3022,7 +3114,7 @@ async function requestRoute(){
     const km=(r.distance/1000).toFixed(2), min=Math.round(r.duration/60);
     $('routeInfo').style.display='block';
     $('routeInfo').innerHTML=`&#128663; <b>${km} km</b> &middot; ~<b>${min} min</b> drive<br>
-      <span style="color:#8fa0b8">Snapped to the real road network by OSRM.</span>`;
+      <span style="color:#8fa0b8">Follows the road centreline exactly (OSRM full geometry).</span>`;
     log(`Route: ${km} km / ${min} min via real roads`,'ok');
   }catch(err){
     log('OSRM error: '+err.message,'err');
@@ -3462,7 +3554,8 @@ function buildGreenscape(){
   if(!satData||!geoCtx) return;
   const {sceneW,sceneH}=geoCtx;
   const cells=GREEN_N*GREEN_N;
-  const veg=new Uint8Array(cells), busy=new Uint8Array(cells);
+  const veg=new Uint8Array(cells), busy=new Uint8Array(cells),
+        built=new Uint8Array(cells);
   // sample satellite greenness per cell (5x5 pixels)
   const d=satData.imgData.data;
   for(let cy=0;cy<GREEN_N;cy++)for(let cx=0;cx<GREEN_N;cx++){
@@ -3487,7 +3580,7 @@ function buildGreenscape(){
     if(!m.userData||!m.userData.lat) return;
     const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
     const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
-    const ci=cellOf(x,z); if(ci>=0) busy[ci]=1;
+    const ci=cellOf(x,z); if(ci>=0){ busy[ci]=1; built[ci]=1; }
     if(m.userData.area>=600&&m.userData.src!=='typo') roofCandidates++;
   });
   trafficPaths.forEach(p=>{ for(let dd=0;dd<p.total;dd+=14){
@@ -3507,7 +3600,8 @@ function buildGreenscape(){
     new THREE.MeshBasicMaterial({map:t,transparent:true,depthWrite:false}));
   m.rotation.x=-Math.PI/2; m.position.y=0.38; PG('green').add(m);
   let vegCount=0; for(let i=0;i<cells;i++) if(veg[i]) vegCount++;
-  greenStats={vegM2:vegCount/cells*sceneW*sceneH, potM2:pot/cells*sceneW*sceneH};
+  greenStats={vegM2:vegCount/cells*sceneW*sceneH, potM2:pot/cells*sceneW*sceneH,
+              veg,busy,built};   // masks feed the vegetation scatter
   const pct=Math.round(pot/cells*100);
   $('stGreen').textContent=pct+'%';
   $('stGreen').title=`${pct}% of ground cells are neither vegetated, built, nor road - candidates for parks/trees. Plus ${roofCandidates} large flat roofs suitable for green roofs.`;
@@ -3987,7 +4081,6 @@ $('buildBtn').addEventListener('click',async()=>{
     buildGround();
     buildBuildings(osm);
     buildRoads(osm);
-    buildTrees(osm);
     buildTraffic();
     buildStreetLamps(osm);
     step('s4','done'); step('s5','doing');
@@ -4016,6 +4109,7 @@ $('buildBtn').addEventListener('click',async()=>{
     plannerClear();
     buildGreenscape();          // after the clear, or it would be wiped
     applyCarbon();              // needs greenStats + solar total
+    buildVegetation(osm);       // needs the greenscape masks + LiDAR
     buildPlannerLayers(b);
     applyObliqueFacades(b);
     applyAirQuality(b);
