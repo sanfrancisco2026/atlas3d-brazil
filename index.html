@@ -887,8 +887,10 @@ function enhanceSatCanvas(cv){
 }
 async function fetchSatellite(b){
   // pick zoom so the stitched image is ~1200-2600 px wide (3200 on
-  // high/medium GPUs - keeps the rooftop vertical imagery crisper)
-  let z=18;
+  // high/medium GPUs). Start at z19 (~0.3m/px) where Esri has it -
+  // rooftops sample the mosaic directly, so this is what makes them
+  // sharp; the ok-tiles check below steps down where z19 is missing.
+  let z=19;
   const maxPx=gfxTier==='low'?2600:3200;
   while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > maxPx) z--;
   // Esri has no high-zoom imagery for many smaller towns: if most tiles
@@ -3169,6 +3171,26 @@ window.__atlasFacadeStats=()=>{ const c={};
   return c; };
 window.__atlasGlowState=()=>facadeAnim.map(f=>f.lit.size);
 window.__atlasGlowTick=dt=>facadeGlowTick(dt);
+// roof fidelity: recompute every cap vertex's expected satellite UV from
+// its world position and report the worst deviation + mosaic sharpness
+window.__atlasRoofCheck=(n=40)=>{
+  if(!geoCtx||!satData) return null;
+  const {sceneW,sceneH}=geoCtx, out={checked:0,maxErr:0};
+  for(const m of cityGroup.children.slice(0,n)){
+    const g=m.geometry; if(!g||!g.groups||!g.attributes.uv) continue;
+    const pos=g.attributes.position, uv=g.attributes.uv;
+    const cap=g.groups.find(x=>x.materialIndex===0); if(!cap) continue;
+    for(let i=cap.start;i<cap.start+cap.count;i++){
+      const eu=(pos.getX(i)+sceneW/2)/sceneW, ev=1-(pos.getZ(i)+sceneH/2)/sceneH;
+      out.maxErr=Math.max(out.maxErr,
+        Math.abs(uv.getX(i)-eu),Math.abs(uv.getY(i)-ev));
+    }
+    out.checked++;
+  }
+  out.mPerPx=Math.round(sceneW/satData.w*100)/100;
+  out.mosaic=satData.w+'x'+satData.h;
+  return out;
+};
 $('timeSlider').addEventListener('input',()=>{ timeAnim=null; applyAtmosphere(); });
 // time-of-day presets: glide the clock instead of jumping, so the sky,
 // lights and reflections are seen transitioning
