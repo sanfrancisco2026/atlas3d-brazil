@@ -3222,6 +3222,33 @@ window.__atlasGeoCheck=()=>{
     lonErrPx:+maxU.toFixed(4), latErrPx:+maxV.toFixed(4),
     lonErrM:+(maxU*mPerPx).toFixed(3), latErrM:+(maxV*mPerPx).toFixed(3)};
 };
+// before/after-extrusion validation: for sampled roof vertices, compare
+// the 2D-map pixel lookup at that geo coordinate (what the footprint
+// showed BEFORE extrusion) with the pixel the extruded roof's stored UV
+// samples (AFTER) - indices must match and the RGBA must be identical
+window.__atlasRoofPixelCheck=(n=30)=>{
+  if(!geoCtx||!satData||!satData.texture.image.getContext) return null;
+  const cx=satData.texture.image.getContext('2d');
+  let checked=0, pixelMismatches=0, maxIdxOff=0;
+  for(const m of cityGroup.children.slice(0,n)){
+    const g=m.geometry;
+    const cap=g&&g.groups&&g.groups.find(x=>x.materialIndex===0);
+    if(!cap||!g.attributes.uv) continue;
+    const pos=g.attributes.position, uv=g.attributes.uv;
+    for(let i=cap.start;i<Math.min(cap.start+12,cap.start+cap.count);i++){
+      const ll=sceneToLatLon(pos.getX(i),pos.getZ(i));
+      const mx=Math.min(satData.w-1,Math.floor((ll.lon-geoCtx.W)/(geoCtx.E-geoCtx.W)*satData.w));
+      const my=Math.min(satData.h-1,Math.floor((1-(ll.lat-geoCtx.S)/(geoCtx.N-geoCtx.S))*satData.h));
+      const rx=Math.min(satData.w-1,Math.floor(uv.getX(i)*satData.w));
+      const ry=Math.min(satData.h-1,Math.floor((1-uv.getY(i))*satData.h));
+      maxIdxOff=Math.max(maxIdxOff,Math.abs(rx-mx),Math.abs(ry-my));
+      const a=cx.getImageData(mx,my,1,1).data, b=cx.getImageData(rx,ry,1,1).data;
+      if(a[0]!==b[0]||a[1]!==b[1]||a[2]!==b[2]) pixelMismatches++;
+      checked++;
+    }
+  }
+  return {vertsChecked:checked,pixelMismatches,maxIndexOffsetPx:maxIdxOff};
+};
 // roof fidelity: recompute every cap vertex's expected satellite UV from
 // its world position and report the worst deviation + mosaic sharpness
 window.__atlasRoofCheck=(n=40)=>{
