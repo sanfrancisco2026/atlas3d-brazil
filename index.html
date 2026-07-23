@@ -2419,6 +2419,58 @@ function meshFromBundle(M,level,code){
   return null;
 }
 const meshCache={};
+/* ---- boundary details (name + population per outlined area) ----
+   Fetched keyless from the live IBGE APIs (localidades for names,
+   agregado 6579 for municipal population estimates), cached for the
+   session, and bound to each outline as tooltip + popup. */
+const muniNames={}, muniPops={};
+const MUNI_DETAIL_EP={'municipality':'municipios','municipal-mesh':'municipios',
+  'micro':'microrregioes','meso':'mesorregioes','state':'estados'};
+// Pure (unit-tested): popup HTML for one outlined area
+function muniPopupHtml(name,code,pop){
+  return `<b>${name||'Area '+code}</b><br>IBGE code ${code}`+
+    (pop?`<br>Population: ${Number(pop).toLocaleString()} (2024 est.)`:'')+
+    '<br><span style="opacity:.7">IBGE territorial mesh &middot; outline only</span>';
+}
+// Pure (unit-tested): unique codarea list -> pipe-joined chunks, sized so
+// the keyless IBGE API URLs stay comfortably under length limits
+function muniCodeChunks(fc,size){
+  const codes=[...new Set(((fc&&fc.features)||[])
+    .map(f=>f.properties&&f.properties.codarea).filter(Boolean).map(String))];
+  const out=[];
+  for(let i=0;i<codes.length;i+=size) out.push(codes.slice(i,i+size).join('|'));
+  return out;
+}
+async function enrichMuniDetails(fc,level){
+  const ep=MUNI_DETAIL_EP[level]; if(!ep) return;
+  try{
+    for(const ch of muniCodeChunks(fc,50)){
+      if(ch.split('|').every(c=>muniNames[c])) continue;    // session cache
+      const js=await (await fetch(
+        `https://servicodados.ibge.gov.br/api/v1/localidades/${ep}/${ch}`)).json();
+      (Array.isArray(js)?js:[js]).forEach(m=>{ if(m&&m.id) muniNames[String(m.id)]=m.nome; });
+      if(ep==='municipios'){                     // population: municipal only
+        const jp=await (await fetch('https://servicodados.ibge.gov.br/api/v3/'+
+          `agregados/6579/periodos/-1/variaveis/9324?localidades=N6[${ch}]`)).json();
+        const series=(jp&&jp[0]&&jp[0].resultados&&jp[0].resultados[0]&&
+          jp[0].resultados[0].series)||[];
+        series.forEach(s=>{ const v=s.serie&&Object.values(s.serie)[0];
+          if(s.localidade&&v) muniPops[String(s.localidade.id)]=+v; });
+      }
+    }
+    if(!ibgeBoundary) return;                    // toggled off meanwhile
+    let named=0;
+    ibgeBoundary.eachLayer(l=>{
+      const code=l.feature&&l.feature.properties&&String(l.feature.properties.codarea);
+      if(!code||!muniNames[code]) return;
+      named++;
+      l.setTooltipContent(muniNames[code]);
+      l.setPopupContent(muniPopupHtml(muniNames[code],code,muniPops[code]));
+    });
+    if(named) log(`IBGE mesh: details bound to ${named} outline(s) - name`+
+      `${Object.keys(muniPops).length?' + population':''} (live IBGE API)`,'ai');
+  }catch(e){ log('IBGE mesh details: '+e.message+' (outlines still shown)','err'); }
+}
 function clearIbgeMesh(){
   if(ibgeBoundary){ map.removeLayer(ibgeBoundary); ibgeBoundary=null; }
   $('ibgeBtn').textContent='IBGE mesh: OFF';
@@ -2444,12 +2496,22 @@ async function showIbgeMesh(){
     }
     if(ibgeBoundary) map.removeLayer(ibgeBoundary);
     const st=MESH_STYLE[level];
-    ibgeBoundary=L.geoJSON(meshCache[key],{style:{...st,
-      fillColor:st.color,fillOpacity:0.02}}).addTo(map);
+    // outlines ONLY - no fill at all, the map shows through untouched;
+    // each boundary carries its details (hover tooltip + click popup)
+    ibgeBoundary=L.geoJSON(meshCache[key],{
+      style:{...st,fill:false},
+      onEachFeature:(f,ly)=>{
+        const code=f.properties&&String(f.properties.codarea);
+        if(!code) return;
+        ly.bindTooltip(muniNames[code]||'IBGE '+code,{sticky:true});
+        ly.bindPopup(muniPopupHtml(muniNames[code],code,muniPops[code]));
+      }
+    }).addTo(map);
     const n=(meshCache[key].features||[]).length;
     btn.textContent=`IBGE: ${MESH_LABEL[level]}${n>1?' ('+n+')':''}`;
     btn.classList.add('active-mode');
-    log(`IBGE mesh: ${MESH_LABEL[level]} - ${n} feature(s), ${level==='municipality'?info.name:'UF '+ufFromCode(info.code)} (${src})`,'ok');
+    log(`IBGE mesh: ${MESH_LABEL[level]} - ${n} outline(s), ${level==='municipality'?info.name:'UF '+ufFromCode(info.code)} (${src}; outlines only, hover/click for details)`,'ok');
+    enrichMuniDetails(meshCache[key],level);       // async names + population
   }catch(err){ clearIbgeMesh(); log('IBGE mesh: '+err.message,'err'); }
 }
 $('ibgeBtn').addEventListener('click',()=>{ ibgeBoundary?clearIbgeMesh():showIbgeMesh(); });
