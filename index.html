@@ -555,6 +555,26 @@ const lerp=(a,b,t)=>a+(b-a)*t;
 function lon2tile(lon,z){ return (lon+180)/360*Math.pow(2,z); }
 function lat2tile(lat,z){ return (1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*Math.pow(2,z); }
 function sceneToLatLon(x,z){ return { lat: geoCtx.cLat - z/M_LAT, lon: geoCtx.cLon + x/geoCtx.mPerLon }; }
+/* Geo-registration of the satellite mosaic: the stitcher places tiles at
+   fractional offsets, so canvas (0,0) is EXACTLY (N,W) and columns are
+   EXACTLY linear in longitude (Mercator x is affine in lon). Rows are
+   linear in Mercator y while consumers (ground plane, roofs, satPixel,
+   green mask) map linearly in latitude - the function below bounds that
+   worst-case row offset; it stays sub-pixel for every zone the app can
+   capture (asserted by test/geo_registration.test.js and live by the
+   __atlasGeoCheck hook). */
+// Pure (unit-tested): worst |Mercator row - linear-in-lat row| in px for
+// a zone of half-height dLat degrees centred at cLat, at tile zoom z.
+function mercRowOffsetPx(cLat,dLat,z){
+  const N=cLat+dLat, S=cLat-dLat;
+  const y0=lat2tile(N,z), h=(lat2tile(S,z)-y0)*256;
+  let m=0;
+  for(let i=0;i<=64;i++){
+    const lat=N+(S-N)*i/64;
+    m=Math.max(m,Math.abs((lat2tile(lat,z)-y0)*256-i/64*h));
+  }
+  return m;
+}
 
 /* ============================================================
    2D MAP + PLACE PICKING
@@ -851,10 +871,17 @@ function loadTile(z,x,y){
 async function stitchSatelliteAt(b,z){
   const xf0=lon2tile(b.W,z), xf1=lon2tile(b.E,z);
   const yf0=lat2tile(b.N,z), yf1=lat2tile(b.S,z);
-  const w=Math.round((xf1-xf0)*256), h=Math.round((yf1-yf0)*256);
+  // exact geo-registration: the true Mercator span is fractional
+  // (e.g. 2452.49px) but a canvas is integer-sized. Scale the tile
+  // draw by w/wf so the requested bbox lands EXACTLY on [0..w]x[0..h] -
+  // without this, every consumer mapping drifts by the rounding
+  // remainder (up to 0.5px) toward the E/S edges.
+  const wf=(xf1-xf0)*256, hf=(yf1-yf0)*256;
+  const w=Math.round(wf), h=Math.round(hf);
   const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
   const ctx=canvas.getContext('2d',{willReadFrequently:true});
   ctx.fillStyle='#182028'; ctx.fillRect(0,0,w,h);
+  ctx.setTransform(w/wf,0,0,h/hf,0,0);
   const jobs=[]; let okTiles=0;
   for(let tx=Math.floor(xf0); tx<=Math.floor(xf1); tx++)
     for(let ty=Math.floor(yf0); ty<=Math.floor(yf1); ty++)
@@ -862,6 +889,7 @@ async function stitchSatelliteAt(b,z){
         if(img){ okTiles++; ctx.drawImage(img,(tx-xf0)*256,(ty-yf0)*256); }
       }));
   await Promise.all(jobs);
+  ctx.setTransform(1,0,0,1,0,0);
   return {canvas,w,h,okTiles,total:jobs.length};
 }
 // Pure (unit-tested): the per-pixel enhancement - saturation lifted 22%
@@ -3171,6 +3199,29 @@ window.__atlasFacadeStats=()=>{ const c={};
   return c; };
 window.__atlasGlowState=()=>facadeAnim.map(f=>f.lit.size);
 window.__atlasGlowTick=dt=>facadeGlowTick(dt);
+// geo-registration audit: for a 9x9 lat/lon grid over the current zone,
+// compare the canvas pixel every consumer's linear mapping produces
+// against the true Web-Mercator pixel the stitcher put there
+window.__atlasGeoCheck=()=>{
+  if(!geoCtx||!satData) return null;
+  const b=geoCtx, w=satData.w, h=satData.h;
+  const z=Math.round(Math.log2(w/256*360/(b.E-b.W)));
+  const x0=lon2tile(b.W,z), y0=lat2tile(b.N,z);
+  // the stitcher scales the draw so the bbox spans exactly [0..w]x[0..h]
+  const su=w/((lon2tile(b.E,z)-x0)*256), sv=h/((lat2tile(b.S,z)-y0)*256);
+  let maxU=0, maxV=0;
+  for(let i=0;i<=8;i++)for(let j=0;j<=8;j++){
+    const lon=b.W+(b.E-b.W)*i/8, lat=b.N+(b.S-b.N)*j/8;
+    const uLin=(lon-b.W)/(b.E-b.W)*w, vLin=(b.N-lat)/(b.N-b.S)*h;
+    const uMerc=(lon2tile(lon,z)-x0)*256*su, vMerc=(lat2tile(lat,z)-y0)*256*sv;
+    maxU=Math.max(maxU,Math.abs(uLin-uMerc));
+    maxV=Math.max(maxV,Math.abs(vLin-vMerc));
+  }
+  const mPerPx=b.sceneW/w;
+  return {z, mosaic:w+'x'+h,
+    lonErrPx:+maxU.toFixed(4), latErrPx:+maxV.toFixed(4),
+    lonErrM:+(maxU*mPerPx).toFixed(3), latErrM:+(maxV*mPerPx).toFixed(3)};
+};
 // roof fidelity: recompute every cap vertex's expected satellite UV from
 // its world position and report the worst deviation + mosaic sharpness
 window.__atlasRoofCheck=(n=40)=>{
