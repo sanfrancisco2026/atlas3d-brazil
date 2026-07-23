@@ -529,7 +529,7 @@ const BUS_PAINT=[0xffffff,0xfff0a8,0xffd9a8,0xcfe4ff,0xd4f2cc,0xffc9c9];
 const VAN_PAINT=[0xf2f2f2,0x9fc7e8,0xd94f4f,0x7fb069,0xe8c34d,0xe8955f];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
-let facadeAnim = [], facadeTickT = 0, facadeTickI = 0, nightNow = 0;
+let facadeAnim = [], facadeTickT = 0, facadeTickI = 0, nightNow = 0, roofMatLive = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
@@ -864,6 +864,27 @@ async function stitchSatelliteAt(b,z){
   await Promise.all(jobs);
   return {canvas,w,h,okTiles,total:jobs.length};
 }
+// Pure (unit-tested): the per-pixel enhancement - saturation lifted 22%
+// around the pixel's own luma, then a mild contrast S around mid-grey,
+// clamped to 0..255. Grey stays grey; greens/reds deepen naturally.
+function enhanceRGB(r,g,b){
+  const l=0.299*r+0.587*g+0.114*b;
+  const c=v=>{ v=(l+(v-l)*1.22-128)*1.07+128;
+    return v<0?0:v>255?255:v; };
+  return [c(r),c(g),c(b)];
+}
+function enhanceSatCanvas(cv){
+  const cx=cv.getContext('2d');
+  const d=cx.getImageData(0,0,cv.width,cv.height), a=d.data;
+  for(let i=0;i<a.length;i+=4){        // inlined enhanceRGB for 10M+ px
+    const l=0.299*a[i]+0.587*a[i+1]+0.114*a[i+2];
+    for(let k=0;k<3;k++){
+      const v=(l+(a[i+k]-l)*1.22-128)*1.07+128;
+      a[i+k]=v<0?0:v>255?255:v;
+    }
+  }
+  cx.putImageData(d,0,0);
+}
 async function fetchSatellite(b){
   // pick zoom so the stitched image is ~1200-2600 px wide (3200 on
   // high/medium GPUs - keeps the rooftop vertical imagery crisper)
@@ -878,6 +899,11 @@ async function fetchSatellite(b){
     z--; s=await stitchSatelliteAt(b,z);
   }
   const imgData=s.canvas.getContext('2d').getImageData(0,0,s.w,s.h);
+  // enhance the DISPLAYED mosaic (ground + rooftops): gentle saturation +
+  // contrast lift so vegetation and roof detail read naturally in 3D.
+  // imgData above stays RAW - every analysis (green mask, shadow model,
+  // satellite tints) keeps working on unmodified pixels.
+  enhanceSatCanvas(s.canvas);
   const texture=new THREE.CanvasTexture(s.canvas);
   texture.colorSpace=THREE.SRGBColorSpace;
   texture.anisotropy=renderer.capabilities.getMaxAnisotropy();
@@ -973,9 +999,9 @@ function classifyGPU(s){
   return 'medium';
 }
 const GFX={
-  high:  {px:2,   shadow:4096, bloomDiv:1, rain:1,   traffic:190, veg:5000},
-  medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150, veg:3000},
-  low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90,  veg:1500},
+  high:  {px:2,   shadow:4096, bloomDiv:1, rain:1,   traffic:190},
+  medium:{px:1.5, shadow:2048, bloomDiv:2, rain:0.7, traffic:150},
+  low:   {px:1,   shadow:0,    bloomDiv:2, rain:0.4, traffic:90},
 };
 // WebGL availability diagnostics. When both contexts are refused but the GPU
 // is healthy elsewhere, the usual culprit is a fingerprint-blocking extension
@@ -1496,7 +1522,14 @@ function buildBuildings(osm){
   // reset any Mapillary-reference tint from the previous zone
   [1,2].forEach(i=>{ if(wallMats[i]) wallMats[i].color.setRGB(1,1,1); });
   pollutionCtx.stacks=[]; pollutionCtx.indArea=0;
-  const roofMat=new THREE.MeshStandardMaterial({map:satData.texture,roughness:.8,metalness:.05});
+  // Rooftops = the vertical satellite image over each footprint, kept
+  // looking like the 2D map: the same mosaic also drives a day-scaled
+  // emissive lift (see applyAtmosphere) so scene lighting/tone-mapping
+  // can't wash the photographed roof out. Matte, non-metallic.
+  const roofMat=new THREE.MeshStandardMaterial({map:satData.texture,
+    emissive:0xffffff,emissiveMap:satData.texture,emissiveIntensity:0.4,
+    roughness:.95,metalness:0});
+  roofMatLive=roofMat;
   const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
   const halfW=sceneW/2, halfH=sceneH/2;
   const feet=collectBuildingFootprints(osm);
@@ -1842,124 +1875,10 @@ function buildRoadLabels(named){
   }).catch(err=>log('Street names unavailable offline: '+err.message,'ai'));
 }
 
-/* ---- trees ---- */
-/* ---- natural vegetation ----
-   Grass tufts, shrubs and two tree forms scattered over the satellite
-   green mask (plus OSM-mapped trees), with heights taken from the SP
-   LiDAR grid where it exists and species/size biased by surroundings:
-   spots beside buildings get shade-tolerant shrubs, slightly smaller
-   and darker; open ground gets the occasional full tree. */
-// Pure (unit-tested): pick archetype + height from measured LiDAR height
-// (when available), building proximity, and a random roll.
-function vegArchetype(lidarH,nearB,r){
-  if(lidarH!=null&&lidarH>=3.5)
-    return {type:r<0.2?'cone':'tree',
-            h:clamp(lidarH,3.5,28)*(nearB?0.85:1), shade:!!nearB};
-  if(lidarH!=null&&lidarH>=1)
-    return {type:'shrub', h:clamp(lidarH,0.6,3), shade:!!nearB};
-  if(lidarH!=null&&lidarH>0)
-    return {type:'grass', h:0.3+r*0.25, shade:!!nearB};
-  if(nearB){                       // street trees line built-up blocks
-    if(r<0.12) return {type:'tree', h:4+r*25, shade:true};
-    return r<0.65?{type:'shrub',h:0.8+r*1.2,shade:true}
-                 :{type:'grass',h:0.3+r*0.2,shade:true};
-  }
-  if(r<0.16) return {type:r<0.03?'cone':'tree', h:5+r*25, shade:false};
-  if(r<0.5)  return {type:'shrub', h:0.7+r*2, shade:false};
-  return {type:'grass', h:0.25+r*0.3, shade:false};
-}
-const VEG_UNIT={tree:1.0,cone:1.05,shrub:0.78,grass:0.53};
-function vegGeometries(){
-  const blob=(r,x,y,z,sy)=>{ const g=new THREE.IcosahedronGeometry(r,1);
-    g.scale(1,sy||1,1); g.translate(x,y,z); return g; };
-  // cylinders/cones are indexed, icosahedra are not - de-index so
-  // mergeGeometries accepts mixed parts
-  const trunkT=new THREE.CylinderGeometry(0.035,0.05,0.42,5).toNonIndexed();
-  trunkT.translate(0,0.21,0);
-  const treeCrown=mergeGeometries([blob(0.30,0,0.70,0,0.9),
-    blob(0.22,0.16,0.58,0.10,0.8), blob(0.20,-0.15,0.60,-0.08,0.85)]);
-  const tree=mergeGeometries([trunkT,treeCrown],true);            // [trunk, crown]
-  const trunkC=new THREE.CylinderGeometry(0.03,0.045,0.30,5).toNonIndexed();
-  trunkC.translate(0,0.15,0);
-  const coneCrown=new THREE.ConeGeometry(0.26,0.75,7).toNonIndexed();
-  coneCrown.translate(0,0.675,0);
-  const cone=mergeGeometries([trunkC,coneCrown],true);
-  const shrub=mergeGeometries([blob(0.42,0,0.42,0,0.85), blob(0.30,0.25,0.30,0.15,0.8)]);
-  const grass=blob(0.5,0,0.28,0,0.5);
-  return {tree,cone,shrub,grass};
-}
-function buildVegetation(osm){
-  clearGroup(treeGroup);
-  if(!geoCtx) return;
-  const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
-  const lidar=lidarAreaFor(cLat,cLon);
-  const rand=mulberry32(((Math.abs(cLat*8e4)|0)^(Math.abs(cLon*8e4)|0))>>>0);
-  const lidarAt=(x,z)=>{ if(!lidar) return null;
-    const ll=sceneToLatLon(x,z); return lidarHeightAt(lidar,ll.lat,ll.lon); };
-  const spots=[];
-  let osmTrees=0;
-  osm.elements.forEach(el=>{
-    if(el.type==='node'&&el.tags&&el.tags.natural==='tree'){
-      const x=(el.lon-cLon)*mPerLon, z=(cLat-el.lat)*M_LAT;
-      const lh=lidarAt(x,z), r=rand();
-      spots.push({x,z,arch:{type:r<0.15?'cone':'tree',
-        h:(lh&&lh>=3)?clamp(lh,4,28):5+r*4, shade:false}});
-      osmTrees++;
-    }
-  });
-  const cap=GFX[gfxTier].veg;
-  const G=greenStats;
-  if(G&&G.veg){
-    const N=GREEN_N, cw=sceneW/N, ch=sceneH/N;
-    for(let cy=0;cy<N&&spots.length<cap;cy++)
-    for(let cx=0;cx<N&&spots.length<cap;cx++){
-      const i=cy*N+cx;
-      if(!G.veg[i]||G.busy[i]) continue;
-      const nearB=[i-1,i+1,i-N,i+N,i-N-1,i-N+1,i+N-1,i+N+1]
-        .some(j=>j>=0&&j<N*N&&G.built[j]);
-      const density=rand();
-      const count=density<0.35?1:density<0.75?2:3;
-      for(let k=0;k<count&&spots.length<cap;k++){
-        const x=(cx+rand())*cw-sceneW/2, z=(cy+rand())*ch-sceneH/2;
-        spots.push({x,z,arch:vegArchetype(lidarAt(x,z),nearB,rand())});
-      }
-    }
-  }
-  if(!spots.length){ log('No vegetation detected in this zone','ai'); return; }
-  const byType={tree:[],cone:[],shrub:[],grass:[]};
-  spots.forEach(s=>byType[s.arch.type].push(s));
-  const geos=vegGeometries();
-  const trunkMat=new THREE.MeshStandardMaterial({color:0x5a4630,roughness:1});
-  const mm=new THREE.Matrix4(), qq=new THREE.Quaternion(), vv=new THREE.Vector3(),
-        ee=new THREE.Euler(), col=new THREE.Color();
-  let lidarScaled=0;
-  Object.entries(byType).forEach(([type,list])=>{
-    if(!list.length) return;
-    const crownMat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1});
-    const mat=(type==='tree'||type==='cone')?[trunkMat,crownMat]:crownMat;
-    const mesh=new THREE.InstancedMesh(geos[type],mat,list.length);
-    list.forEach((s,i)=>{
-      const sv=s.arch.h/VEG_UNIT[type];
-      const sh=sv*(0.75+rand()*0.5);
-      ee.set(0,rand()*Math.PI*2,0); qq.setFromEuler(ee);
-      mm.compose(vv.set(s.x,0,s.z),qq,new THREE.Vector3(sh,sv,sh));
-      mesh.setMatrixAt(i,mm);
-      const grassy=type==='grass';
-      col.setHSL(grassy?0.22+rand()*0.08:0.27+rand()*0.08,
-                 (grassy?0.5:0.45)*(s.arch.shade?0.85:1),
-                 (grassy?0.32:0.30+rand()*0.10)*(s.arch.shade?0.75:1));
-      mesh.setColorAt(i,col);
-      if(lidar&&s.arch.type!=='grass') lidarScaled++;
-    });
-    if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
-    mesh.castShadow=type!=='grass';
-    treeGroup.add(mesh);
-  });
-  log(`Vegetation: ${byType.tree.length+byType.cone.length} trees `+
-    `(${osmTrees} OSM-mapped), ${byType.shrub.length} shrubs, `+
-    `${byType.grass.length} grass tufts`+
-    (lidar?` - heights from PMSP LiDAR (${lidarScaled} scaled)`:''),'ok');
-}
+/* 3D vegetation was removed on user request (procedural trees/shrubs
+   read as artificial). Ground vegetation now comes from the ENHANCED
+   satellite mosaic itself - see enhanceSatCanvas(). The greenscape
+   masks (satellite green detection) remain for carbon + planner use. */
 
 /* ---- ambient traffic ----
    Mixed fleet (cars / motorcycles / buses) with per-instance paint colours,
@@ -3183,6 +3102,9 @@ function applyAtmosphere(){
   renderer.toneMappingExposure=0.2+0.42*day;
   stars.material.opacity=night*0.9;
 
+  // rooftops: day-scaled self-illumination keeps the photographed roof
+  // reading like the vertical satellite image; fades out at night
+  if(roofMatLive) roofMatLive.emissiveIntensity=0.05+day*0.45;
   // warm window glow + street lamps, calibrated by VIIRS Black Marble
   wallMats.forEach(m=>m.emissiveIntensity=night*1.6*nightCalib);
   matRoadMajor.emissiveIntensity=0.05+night*1.1;
@@ -4469,7 +4391,6 @@ $('buildBtn').addEventListener('click',async()=>{
     plannerClear();
     buildGreenscape();          // after the clear, or it would be wiped
     applyCarbon();              // needs greenStats + solar total
-    buildVegetation(osm);       // needs the greenscape masks + LiDAR
     buildPlannerLayers(b);
     applyObliqueFacades(b);
     applyAirQuality(b);
