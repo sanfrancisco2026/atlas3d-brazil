@@ -432,6 +432,18 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="cadBtn" class="ghost">Cadastral: OFF</button>
     </div>
 
+    <div class="slider-row" style="margin-top:12px"><span>GIS analysis</span><b></b></div>
+    <div class="btn-row">
+      <button id="measureBtn" class="ghost">&#128207; Measure</button>
+      <button id="sunBtn" class="ghost">&#9728; Sun hours</button>
+    </div>
+    <div class="btn-row">
+      <button id="cjBtn" class="ghost">&#11015; CityJSON</button>
+      <button id="shareBtn" class="ghost">&#128279; Share link</button>
+    </div>
+    <div class="slider-row"><span>Flood rise (above lowest terrain)</span><b id="floodVal">off</b></div>
+    <input type="range" id="floodRise" min="0" max="10" step="0.5" value="0">
+
     <div id="stats" style="display:grid">
       <div class="stat"><span class="v" id="stBuildings">0</span><span class="k">Real buildings</span></div>
       <div class="stat"><span class="v" id="stSynth" style="color:#8fb8ff">0</span><span class="k">Synthetic infill</span></div>
@@ -1726,8 +1738,13 @@ function buildBuildings(osm){
     const matIdx=variant===0?pickGlassStyle(h,p.rand()):variant;   // glass family
     const mesh=new THREE.Mesh(geom,[roofMat,wallMats[matIdx]]);
     mesh.castShadow=true; mesh.receiveShadow=true;
-    mesh.userData={h,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
-      area:Math.round(p.area),
+    // ring: ordered footprint (closing duplicate dropped) - feeds the GIS
+    // analysis suite (sun-hours heightfield raster + CityJSON LoD1 export)
+    const ring=p.pts.map(v=>[v.x,v.y]);
+    if(ring.length>1&&Math.hypot(ring[0][0]-ring[ring.length-1][0],
+       ring[0][1]-ring[ring.length-1][1])<1e-6) ring.pop();
+    mesh.userData={h,minH,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
+      area:Math.round(p.area), ring,
       src:p.tagged?(p.tags['lidar:height']?'lidar':(p.tags['ms:footprint']?'ms':'osm'))
          :(p.shadow?'shadow':'typo')};   // height provenance
 
@@ -3288,6 +3305,305 @@ $('timeSlider').addEventListener('change',()=>{ if(appState==='city') refreshEnv
 $('fogSlider').addEventListener('input',applyAtmosphere);
 
 /* ============================================================
+   GIS ANALYSIS SUITE
+   Competitive parity with commercial digital twins (ArcGIS Urban,
+   Cesium, Shadowmap): in-scene measurement, sun-hours shadow
+   analysis, interactive flood-rise simulation, standards-based
+   CityJSON LoD1 export, and shareable permalinks.
+============================================================ */
+let measureMode=false, measurePts=[], measureGroup=null;
+let sunGroup=null, floodSimGroup=null;
+
+/* ---- measurement (distance + area) ---- */
+// Pure (unit-tested): polyline length over {x,z} points, metres
+function pathLength(pts){
+  let L=0;
+  for(let i=0;i<pts.length-1;i++)
+    L+=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z);
+  return L;
+}
+// Pure (unit-tested): shoelace area of the closed {x,z} polygon, m2
+function polyArea(pts){
+  if(pts.length<3) return 0;
+  let a=0;
+  for(let i=0;i<pts.length;i++){
+    const p=pts[i], q=pts[(i+1)%pts.length];
+    a+=p.x*q.z-q.x*p.z;
+  }
+  return Math.abs(a)/2;
+}
+function fmtDist(m){ return m>=1000?(m/1000).toFixed(2)+' km':Math.round(m)+' m'; }
+function fmtArea(m2){ return m2>=1e6?(m2/1e6).toFixed(2)+' km²'
+  :m2>=1e4?(m2/1e4).toFixed(2)+' ha':Math.round(m2).toLocaleString()+' m²'; }
+function clearMeasure(){
+  if(measureGroup){ scene.remove(measureGroup);
+    measureGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    measureGroup=null; }
+  measurePts=[];
+  $('measureBtn').innerHTML='&#128207; Measure';
+}
+function toggleMeasure(){
+  if(measureMode){ measureMode=false; clearMeasure(); return; }
+  measureMode=true; setRouteMode(false); hideBldCard();
+  measurePts=[]; measureGroup=new THREE.Group(); scene.add(measureGroup);
+  $('measureBtn').innerHTML='&#128207; Measuring&hellip; (click points, Esc ends)';
+  log('Measure: click ground points - running distance shown on the button; '+
+      '3+ points also report enclosed area. Esc or the button ends it.','ai');
+}
+function measureClick(p){
+  measurePts.push({x:p.x,z:p.z});
+  const s=new THREE.Mesh(new THREE.SphereGeometry(1.6,10,10),
+    new THREE.MeshBasicMaterial({color:0x4dff9d}));
+  s.position.set(p.x,1.2,p.z); measureGroup.add(s);
+  if(measurePts.length>1){
+    const a=measurePts[measurePts.length-2], b=measurePts[measurePts.length-1];
+    const g=new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(a.x,1.2,a.z),new THREE.Vector3(b.x,1.2,b.z)]);
+    measureGroup.add(new THREE.Line(g,
+      new THREE.LineBasicMaterial({color:0x4dff9d,transparent:true,opacity:.95})));
+  }
+  const L=pathLength(measurePts), A=polyArea(measurePts);
+  $('measureBtn').innerHTML='&#128207; '+fmtDist(L)+
+    (measurePts.length>=3?' &middot; '+fmtArea(A):'');
+  if(measurePts.length>=2)
+    log(`Measure: ${fmtDist(L)}${measurePts.length>=3?' - area '+fmtArea(A):''}`,'ok');
+}
+
+/* ---- sun-hours shadow analysis (2.5D heightfield) ---- */
+// Pure (unit-tested): rasterize footprint rings into an NxN height grid
+function buildHeightGrid(builds,N,sceneW,sceneH){
+  const h=new Float32Array(N*N);
+  builds.forEach(b=>{
+    if(!b.ring||b.ring.length<3) return;
+    const poly=b.ring.map(([x,z])=>({x,y:z}));
+    let x0=1/0,x1=-1/0,z0=1/0,z1=-1/0;
+    b.ring.forEach(([x,z])=>{ x0=Math.min(x0,x); x1=Math.max(x1,x);
+                              z0=Math.min(z0,z); z1=Math.max(z1,z); });
+    const gx0=Math.max(0,Math.floor((x0/sceneW+0.5)*N));
+    const gx1=Math.min(N-1,Math.ceil((x1/sceneW+0.5)*N));
+    const gz0=Math.max(0,Math.floor((z0/sceneH+0.5)*N));
+    const gz1=Math.min(N-1,Math.ceil((z1/sceneH+0.5)*N));
+    for(let gz=gz0;gz<=gz1;gz++)for(let gx=gx0;gx<=gx1;gx++){
+      const px=(gx+0.5)/N*sceneW-sceneW/2, pz=(gz+0.5)/N*sceneH-sceneH/2;
+      if(pointInPoly(poly,px,pz)){ const i=gz*N+gx; if(b.h>h[i]) h[i]=b.h; }
+    }
+  });
+  return {h,N,sceneW,sceneH,step:Math.max(sceneW,sceneH)/N,maxDist:420};
+}
+// Pure (unit-tested): is the ground point shaded for one sun position?
+// March toward the sun; a cell taller than the climbing ray blocks it.
+function sunBlocked(hg,x,z,sx,sz,tanEl){
+  for(let d=hg.step; d<=hg.maxDist; d+=hg.step){
+    const px=x+sx*d, pz=z+sz*d;
+    const gx=Math.floor((px/hg.sceneW+0.5)*hg.N);
+    const gz=Math.floor((pz/hg.sceneH+0.5)*hg.N);
+    if(gx<0||gz<0||gx>=hg.N||gz>=hg.N) return false;     // open sky beyond zone
+    if(hg.h[gz*hg.N+gx]>d*tanEl+0.5) return true;
+  }
+  return false;
+}
+// Pure (unit-tested): hours of direct sun (1 sample per daylight hour)
+function sunHoursAt(hg,x,z,suns){
+  let lit=0;
+  for(const s of suns) if(!sunBlocked(hg,x,z,s.sx,s.sz,s.tanEl)) lit++;
+  return lit;
+}
+// Pure (unit-tested): hourly sun directions from the app's own sky model
+// - horizontal unit vector TOWARD the sun + tan(elevation)
+function sunTrack(){
+  const suns=[];
+  for(let hour=6.5;hour<=17.5;hour+=1){
+    const elev=Math.sin((hour-6)/12*Math.PI);
+    if(elev<=0.06) continue;                 // below usable horizon
+    const az=(hour-12)/12*Math.PI+Math.PI*0.35;
+    const e=elev*Math.PI/2*0.92;
+    const hx=Math.cos(az)*Math.cos(e), hz=Math.sin(az)*Math.cos(e);
+    const hyp=Math.hypot(hx,hz)||1e-9;
+    suns.push({sx:hx/hyp,sz:hz/hyp,tanEl:Math.sin(e)/hyp});
+  }
+  return suns;
+}
+function clearSunAnalysis(){
+  if(sunGroup){ scene.remove(sunGroup);
+    sunGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    sunGroup=null; }
+  $('sunBtn').innerHTML='&#9728; Sun hours';
+}
+function runSunAnalysis(){
+  if(sunGroup){ clearSunAnalysis(); return; }            // toggle off
+  if(appState!=='city'||!geoCtx) return;
+  const t0=performance.now();
+  const builds=cityGroup.children.concat(synGroup.visible?synGroup.children:[])
+    .filter(m=>m.userData&&m.userData.ring)
+    .map(m=>({ring:m.userData.ring,h:m.userData.h}));
+  const {sceneW,sceneH}=geoCtx;
+  const N=160;
+  const hg=buildHeightGrid(builds,N,sceneW,sceneH);
+  const suns=sunTrack();
+  const hours=new Float32Array(N*N);
+  let ground=0, deepShade=0, sum=0;
+  for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
+    const i=gz*N+gx;
+    if(hg.h[i]>0){ hours[i]=-1; continue; }              // inside a building
+    const x=(gx+0.5)/N*sceneW-sceneW/2, z=(gz+0.5)/N*sceneH-sceneH/2;
+    const hcount=sunHoursAt(hg,x,z,suns);
+    hours[i]=hcount; ground++; sum+=hcount;
+    if(hcount<2) deepShade++;
+  }
+  // heatmap: deep blue (full shade) -> warm yellow (full sun)
+  const c=document.createElement('canvas'); c.width=c.height=N;
+  const ctx=c.getContext('2d'), im=ctx.createImageData(N,N);
+  for(let i=0;i<N*N;i++){
+    const o=i*4, hv=hours[i];
+    if(hv<0){ im.data[o+3]=0; continue; }                // buildings transparent
+    const t=hv/suns.length;
+    im.data[o]=Math.round(30+t*225); im.data[o+1]=Math.round(50+t*170);
+    im.data[o+2]=Math.round(140-t*90); im.data[o+3]=150;
+  }
+  ctx.putImageData(im,0,0);
+  const tex=new THREE.CanvasTexture(c); tex.magFilter=THREE.LinearFilter;
+  sunGroup=new THREE.Group();
+  const plane=new THREE.Mesh(new THREE.PlaneGeometry(sceneW,sceneH),
+    new THREE.MeshBasicMaterial({map:tex,transparent:true,depthWrite:false}));
+  plane.rotation.x=-Math.PI/2; plane.position.y=0.46; sunGroup.add(plane);
+  scene.add(sunGroup);
+  const ms=Math.round(performance.now()-t0);
+  const avg=ground?sum/ground:0;
+  window.__atlasSunStats={avgHours:+avg.toFixed(2),
+    deepShadePct:+(deepShade/Math.max(1,ground)*100).toFixed(1),
+    daylight:suns.length,ms};
+  $('sunBtn').innerHTML='&#9728; Sun: ON';
+  log(`Sun-hours analysis: avg ${avg.toFixed(1)}h of ${suns.length}h daylight `+
+    `on open ground; ${(deepShade/Math.max(1,ground)*100).toFixed(0)}% in deep `+
+    `shade (<2h). 2.5D building-shadow march, ${N}x${N} grid, ${ms}ms.`,'ok');
+}
+
+/* ---- interactive flood-rise simulation ---- */
+// Pure (unit-tested): flooded fraction of the terrain grid at +rise metres
+function floodStats(elev,mn,rise){
+  if(!elev||!elev.length) return {cells:0,frac:0};
+  const lvl=mn+rise;
+  const cells=elev.filter(e=>e<lvl).length;
+  return {cells,frac:cells/elev.length};
+}
+function clearFloodSim(){
+  if(floodSimGroup){ scene.remove(floodSimGroup);
+    floodSimGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    floodSimGroup=null; }
+  $('floodVal').textContent='off';
+}
+function applyFloodRise(){
+  clearFloodSim();
+  const rise=parseFloat($('floodRise').value);
+  if(!rise) return;
+  if(!terrainGrid){ log('Flood simulation needs the terrain grid (elevation fetch pending or unavailable)','err'); return; }
+  const {elev,N,mn}=terrainGrid, lvl=mn+rise;
+  const st=floodStats(elev,mn,rise);
+  let wetBld=0;
+  cityGroup.children.forEach(m=>{
+    if(!m.userData||!m.userData.lat) return;
+    const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
+    const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
+    if(terrainAt(x,z)<lvl) wetBld++;
+  });
+  const c=document.createElement('canvas'); c.width=c.height=256;
+  const x2=c.getContext('2d'); const cell=256/N;
+  x2.filter='blur(6px)'; x2.fillStyle='rgba(30,120,255,0.55)';
+  for(let gy=0;gy<N;gy++)for(let gx=0;gx<N;gx++)
+    if(elev[gy*N+gx]<lvl) x2.fillRect(gx*cell,(N-1-gy)*cell,cell,cell);
+  const t=new THREE.CanvasTexture(c);
+  floodSimGroup=new THREE.Group();
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(geoCtx.sceneW,geoCtx.sceneH),
+    new THREE.MeshBasicMaterial({map:t,transparent:true,depthWrite:false}));
+  m.rotation.x=-Math.PI/2; m.position.y=0.5; floodSimGroup.add(m);
+  scene.add(floodSimGroup);
+  $('floodVal').textContent='+'+rise.toFixed(1)+'m';
+  log(`Flood simulation +${rise.toFixed(1)}m: ${(st.frac*100).toFixed(0)}% of the `+
+    `zone under water level ${Math.round(lvl)}m; ~${wetBld} buildings affected `+
+    `(planar SRTM-grid estimate - indicative only)`,'ok');
+}
+
+/* ---- CityJSON LoD1 export (CityGML-family interchange standard) ---- */
+// Pure (unit-tested): CityJSON 1.1 with one LoD1 Solid per building.
+// Local ENU metres (x east, y north, z up), origin at the zone centre -
+// stated in metadata.referenceSystem alongside the origin lat/lon.
+function cityJSONFrom(builds,center){
+  const vertices=[]; const CityObjects={};
+  builds.forEach((b,bi)=>{
+    const n=b.ring.length; if(n<3) return;
+    const base=vertices.length, minH=b.minH||0;
+    b.ring.forEach(([x,z])=>vertices.push(
+      [Math.round(x*1000),Math.round(-z*1000),Math.round(minH*1000)]));
+    b.ring.forEach(([x,z])=>vertices.push(
+      [Math.round(x*1000),Math.round(-z*1000),Math.round(b.h*1000)]));
+    const bot=[...Array(n).keys()].map(k=>base+k).reverse();
+    const top=[...Array(n).keys()].map(k=>base+n+k);
+    const sides=[...Array(n).keys()].map(k=>{
+      const a=base+k, c=base+(k+1)%n;
+      return [a,c,c+n,a+n];
+    });
+    CityObjects['bld_'+bi]={type:'Building',
+      attributes:{measuredHeight:+(+b.h).toFixed(2),heightSource:b.src||'unknown'},
+      geometry:[{type:'Solid',lod:'1',
+        boundaries:[[[bot],[top],...sides.map(s=>[s])]]}]};
+  });
+  return {type:'CityJSON',version:'1.1',
+    transform:{scale:[0.001,0.001,0.001],translate:[0,0,0]},
+    metadata:{title:'ATLAS-3D LoD1 building export',
+      referenceSystem:'local ENU metres; origin lat '+center.lat.toFixed(6)+
+        ', lon '+center.lon.toFixed(6)+' (WGS84)'},
+    CityObjects,vertices};
+}
+function exportCityJSON(){
+  if(appState!=='city'||!geoCtx){ return; }
+  const builds=cityGroup.children
+    .filter(m=>m.userData&&m.userData.ring)
+    .map(m=>({ring:m.userData.ring,h:m.userData.h,minH:m.userData.minH,
+              src:m.userData.src}));
+  if(!builds.length){ log('CityJSON: no mapped buildings to export','err'); return; }
+  const cj=cityJSONFrom(builds,{lat:geoCtx.cLat,lon:geoCtx.cLon});
+  downloadBlob((geoCtx.placeName||'atlas3d').replace(/[^\w-]+/g,'_')+'.city.json',
+    new Blob([JSON.stringify(cj)],{type:'application/json'}));
+  log(`CityJSON 1.1 export: ${builds.length} LoD1 building solids `+
+    `(real OSM/ML footprints; synthetic infill excluded), local ENU frame `+
+    `centred ${geoCtx.cLat.toFixed(4)}, ${geoCtx.cLon.toFixed(4)}`,'ok');
+}
+window.__atlasCityJSON=()=>{
+  const builds=cityGroup.children.filter(m=>m.userData&&m.userData.ring)
+    .map(m=>({ring:m.userData.ring,h:m.userData.h,minH:m.userData.minH,src:m.userData.src}));
+  return geoCtx?cityJSONFrom(builds,{lat:geoCtx.cLat,lon:geoCtx.cLon}):null;
+};
+
+/* ---- shareable permalinks ---- */
+// Pure (unit-tested): location + capture radius + clock encoded in the hash
+function encodeShareHash(lat,lon,r,hour){
+  return '#loc='+lat.toFixed(5)+','+lon.toFixed(5)+','+Math.round(r)+','+hour;
+}
+function decodeShareHash(h){
+  const m=/^#loc=(-?[\d.]+),(-?[\d.]+),(\d+),([\d.]+)$/.exec(h||'');
+  return m?{lat:+m[1],lon:+m[2],r:+m[3],hour:+m[4]}:null;
+}
+function shareLink(){
+  if(!geoCtx) return;
+  const hash=encodeShareHash(geoCtx.cLat,geoCtx.cLon,
+    parseInt($('radiusSlider').value),parseFloat($('timeSlider').value));
+  const url=location.origin+location.pathname+hash;
+  history.replaceState(null,'',hash);
+  (navigator.clipboard?navigator.clipboard.writeText(url):Promise.reject())
+    .then(()=>log('Share link copied to clipboard: '+url,'ok'))
+    .catch(()=>log('Share link (copy manually): '+url,'ok'));
+}
+function clearAnalysis(){          // on rebuild / back-to-map
+  measureMode=false; clearMeasure(); clearSunAnalysis(); clearFloodSim();
+  $('floodRise').value=0;
+}
+$('measureBtn').addEventListener('click',toggleMeasure);
+$('sunBtn').addEventListener('click',runSunAnalysis);
+$('floodRise').addEventListener('input',applyFloodRise);
+$('cjBtn').addEventListener('click',exportCityJSON);
+$('shareBtn').addEventListener('click',shareLink);
+
+/* ============================================================
    OSRM ROUTING IN 3D
 ============================================================ */
 const raycaster=new THREE.Raycaster(), mouseNDC=new THREE.Vector2();
@@ -3296,6 +3612,11 @@ function onCanvasClick(e){
   if(downXY&&Math.hypot(e.clientX-downXY[0],e.clientY-downXY[1])>6) return; // was a drag
   mouseNDC.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);
   raycaster.setFromCamera(mouseNDC,camera);
+  if(measureMode){
+    const hit=raycaster.intersectObject(groundMesh);
+    if(hit.length) measureClick(hit[0].point);
+    return;
+  }
   if(routeMode){
     const hit=raycaster.intersectObject(groundMesh);
     if(!hit.length) return;
@@ -3341,7 +3662,8 @@ function hideBldCard(){
   if(selEdges){ scene.remove(selEdges);
     selEdges.geometry.dispose(); selEdges.material.dispose(); selEdges=null; }
 }
-addEventListener('keydown',e=>{ if(e.key==='Escape') hideBldCard(); });
+addEventListener('keydown',e=>{ if(e.key==='Escape'){ hideBldCard();
+  if(measureMode){ measureMode=false; clearMeasure(); } } });
 
 /* ---- free navigation: zoom buttons, WASD flight, double-click fly-to ---- */
 function dollyZoom(f){
@@ -4489,6 +4811,7 @@ $('buildBtn').addEventListener('click',async()=>{
 
     // planner overlays + optional photo facades (async, non-blocking)
     plannerClear();
+    clearAnalysis();            // stale measurements/overlays from last zone
     buildGreenscape();          // after the clear, or it would be wiped
     applyCarbon();              // needs greenStats + solar total
     buildPlannerLayers(b);
@@ -4513,7 +4836,7 @@ $('buildBtn').addEventListener('click',async()=>{
 $('resetBtn').addEventListener('click',()=>{
   appState='map';
   $('zoomCtl').style.display='none';
-  setRouteMode(false); hideBldCard(); routeCurve=null; routePulses=[];
+  setRouteMode(false); hideBldCard(); clearAnalysis(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
   clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=true;
   $('synBtn').textContent='Synthetic infill: ON';
@@ -4563,6 +4886,18 @@ function animate(){
    BOOT
 ============================================================ */
 initMap();
+// shared permalink: restore location, capture radius and clock from the hash
+{
+  const sh=decodeShareHash(location.hash);
+  if(sh){
+    map.setView([sh.lat,sh.lon],16);
+    $('radiusSlider').value=sh.r; $('radiusVal').textContent=sh.r+' m';
+    $('timeSlider').value=sh.hour;
+    updateSelection();
+    log(`Shared location restored (${sh.lat.toFixed(4)}, ${sh.lon.toFixed(4)}, `+
+      `${sh.r}m) - press Build Immersive 3D`,'ok');
+  }
+}
 try{
   initThree();
 }catch(err){

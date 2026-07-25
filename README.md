@@ -40,7 +40,14 @@ the module script.)
 - **Analysis** — routing that follows the OSRM polyline exactly, greedy
   set-cover cell-tower planner with per-tower siting justification, rooftop
   solar potential, carbon-credit scenarios, pollution/AQ effects.
-- **Export** — postcard PNG and GLB scene export.
+- **GIS analysis suite** — click-to-measure distance and area in the scene;
+  sun-hours shadow analysis (2.5D building-shadow march heatmap over the
+  whole zone, sub-second); interactive flood-rise slider (% area and
+  buildings affected on the SRTM terrain grid); shareable permalinks that
+  restore location, capture radius and time of day from the URL.
+- **Export** — postcard PNG, GLB scene export, and **CityJSON 1.1** LoD1
+  building solids with height-provenance attributes (CityGML-family
+  interchange, opens in ninja/QGIS-CityJSON tooling).
 
 ## Offline datasets
 
