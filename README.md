@@ -43,8 +43,11 @@ the module script.)
 - **GIS analysis suite** — click-to-measure distance and area in the scene;
   sun-hours shadow analysis (2.5D building-shadow march heatmap over the
   whole zone, sub-second); interactive flood-rise slider (% area and
-  buildings affected on the SRTM terrain grid); shareable permalinks that
-  restore location, capture radius and time of day from the URL.
+  buildings affected on the SRTM terrain grid); walk-time isochrones
+  (click a point - streets colour by 5/10/15-minute walking bands via
+  Dijkstra over the walkable street graph incl. T-junctions, with
+  buildings-reachable counts); shareable permalinks that restore
+  location, capture radius and time of day from the URL.
 - **Export** — postcard PNG, GLB scene export, and **CityJSON 1.1** LoD1
   building solids with height-provenance attributes (CityGML-family
   interchange, opens in ninja/QGIS-CityJSON tooling).

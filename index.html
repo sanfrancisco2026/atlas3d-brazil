@@ -441,6 +441,9 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="cjBtn" class="ghost">&#11015; CityJSON</button>
       <button id="shareBtn" class="ghost">&#128279; Share link</button>
     </div>
+    <div class="btn-row">
+      <button id="isoBtn" class="ghost">&#128694; Walkshed</button>
+    </div>
     <div class="slider-row"><span>Flood rise (above lowest terrain)</span><b id="floodVal">off</b></div>
     <input type="range" id="floodRise" min="0" max="10" step="0.5" value="0">
 
@@ -528,7 +531,7 @@ let geoCtx = null;              // {cLat,cLon,mPerLon,W,E,S,N,sceneW,sceneH}
 let satData = null;             // {texture, imgData, w, h}
 let appState = 'map';
 let routeMode = false, routeClicks = [], routeCurve = null, routePulses = [];
-let trafficPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {}, vehModelMats = {};
+let trafficPaths = [], walkPaths = [], cars = [], trafficMeshes = [], vehModelGeos = {}, vehModelMats = {};
 let trailerMat = null, vehDetailMat = null, vehModelGrouped = {};
 // truck cab liveries (trailers stay freight white)
 const TRUCK_PAINT=[0xc23b3b,0x2b5fa8,0x2e7d46,0xd97a1a,0x555a63,0xe6e6e6];
@@ -1784,6 +1787,8 @@ const ROAD_CLASS={
   pedestrian:[3,0],footway:[1.6,0],path:[1.4,0],cycleway:[2,0]
 };
 const DRIVABLE=new Set(['motorway','trunk','primary','secondary','tertiary','residential','unclassified','living_street','service']);
+// walkable = every mapped way except pedestrian-banned expressways
+const WALKABLE=new Set(Object.keys(ROAD_CLASS).filter(k=>k!=='motorway'&&k!=='trunk'));
 function ribbonGeometry(points,width,y){
   const hw=width/2, P=[], I=[];
   const dirs=[];
@@ -1805,7 +1810,7 @@ function ribbonGeometry(points,width,y){
   return g;
 }
 function buildRoads(osm){
-  clearGroup(roadGroup); trafficPaths=[];
+  clearGroup(roadGroup); trafficPaths=[]; walkPaths=[];
   pollutionCtx.majorKm=0; pollutionCtx.minorKm=0;
   const namedRoads=[];
   const {cLat,cLon,mPerLon}=geoCtx;
@@ -1825,12 +1830,13 @@ function buildRoads(osm){
       major?matRoadMajor:matRoadMinor);
     mesh.receiveShadow=true;
     roadGroup.add(mesh);
-    if(DRIVABLE.has(el.tags.highway)&&len>40){
-      // cumulative distances for traffic animation
-      const cum=[0]; for(let i=0;i<pts.length-1;i++)
-        cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
+    // cumulative distances (traffic animation + walkshed graph)
+    const cum=[0]; for(let i=0;i<pts.length-1;i++)
+      cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
+    if(DRIVABLE.has(el.tags.highway)&&len>40)
       trafficPaths.push({pts,cum,total:len,major,hw:cls[0]/2});   // buses stick to major roads
-    }
+    if(WALKABLE.has(el.tags.highway)&&len>10)
+      walkPaths.push({pts,cum,total:len});   // incl. footways/pedestrian ways
     if(el.tags.name&&len>60&&(major||len>120))
       namedRoads.push({name:el.tags.name,pts,len,major});
   });
@@ -3593,10 +3599,177 @@ function shareLink(){
     .then(()=>log('Share link copied to clipboard: '+url,'ok'))
     .catch(()=>log('Share link (copy manually): '+url,'ok'));
 }
+/* ---- walk-time isochrone (walkshed) over the street network ---- */
+let isoMode=false, isoGroup=null;
+const WALK_SPEED=1.333;                   // m/s (80 m/min planning standard)
+const ISO_BANDS=[[300,0x39e75f],[600,0xffd23f],[900,0xff8c42]];  // 5/10/15 min
+// Pure (unit-tested): T-junction connections - a way ENDING beside the
+// MIDDLE of another way joins it there. OSM side streets meet avenues
+// mid-way, so endpoint-only junctions would fragment the walk graph.
+function buildTJunctions(paths,tol){
+  const CELL=8, hash=new Map();
+  const key=(x,z)=>Math.round(x/CELL)+','+Math.round(z/CELL);
+  paths.forEach((p,pi)=>{ for(let d=0;d<=p.total;d+=6){
+    const q=pointOnPath(p,d), k=key(q.x,q.z);
+    if(!hash.has(k)) hash.set(k,[]);
+    hash.get(k).push({pi,d,x:q.x,z:q.z});
+  }});
+  const tj=new Array(paths.length*2).fill(null);
+  paths.forEach((p,pi)=>[0,1].forEach(end=>{
+    const pt=_pathEnd(p,end), best=new Map();
+    const cx=Math.round(pt.x/CELL), cz=Math.round(pt.z/CELL);
+    for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){
+      const lst=hash.get((cx+dx)+','+(cz+dz)); if(!lst) continue;
+      for(const s of lst){
+        if(s.pi===pi) continue;
+        const hop=Math.hypot(s.x-pt.x,s.z-pt.z);
+        if(hop<=tol&&(!best.has(s.pi)||hop<best.get(s.pi).hop))
+          best.set(s.pi,{p:s.pi,d:s.d,hop});
+      }
+    }
+    if(best.size) tj[pi*2+end]=[...best.values()];
+  }));
+  return tj;
+}
+// Pure (unit-tested): Dijkstra over path endpoints using the endpoint
+// junction hash PLUS bidirectional T-junction edges. Returns walking
+// METRES from the start point {pi,d} to every path endpoint
+// (Infinity = unreachable).
+function walkReach(paths,net,start,tj){
+  const times=new Array(paths.length*2).fill(Infinity);
+  if(!paths.length||!start) return times;
+  times[start.pi*2]=start.d;
+  times[start.pi*2+1]=paths[start.pi].total-start.d;
+  const rev=[];       // per path: other ways' endpoints beside its middle
+  if(tj) tj.forEach((lst,w)=>{ if(lst) lst.forEach(t=>{
+    (rev[t.p]=rev[t.p]||[]).push({w,d:t.d,hop:t.hop}); }); });
+  const done=new Array(times.length).fill(false);
+  for(;;){
+    let u=-1,best=Infinity;
+    for(let i=0;i<times.length;i++)
+      if(!done[i]&&times[i]<best){ best=times[i]; u=i; }
+    if(u<0) break;
+    done[u]=true;
+    const pi=u>>1, end=u&1, p=paths[pi];
+    const v=pi*2+(1-end);                       // other end of the same way
+    if(times[u]+p.total<times[v]) times[v]=times[u]+p.total;
+    const pt=_pathEnd(p,end);                   // endpoint junction hops
+    for(const e of _near(net,paths,pt)){
+      const w=e.p*2+e.end;
+      const q=_pathEnd(paths[e.p],e.end);
+      const hop=Math.hypot(q.x-pt.x,q.z-pt.z);
+      if(times[u]+hop<times[w]) times[w]=times[u]+hop;
+    }
+    if(tj&&tj[u]) for(const t of tj[u]){        // this end -> other way's middle
+      const q=paths[t.p];
+      if(times[u]+t.hop+t.d<times[t.p*2]) times[t.p*2]=times[u]+t.hop+t.d;
+      if(times[u]+t.hop+(q.total-t.d)<times[t.p*2+1])
+        times[t.p*2+1]=times[u]+t.hop+(q.total-t.d);
+    }
+    if(rev[pi]) for(const r of rev[pi]){        // this way's middle -> that end
+      const along=end?p.total-r.d:r.d;
+      if(times[u]+along+r.hop<times[r.w]) times[r.w]=times[u]+along+r.hop;
+    }
+  }
+  return times;
+}
+// Pure (unit-tested): walking metres to the point d along path pi. The
+// origin path is special: distance there is direct along the way, not
+// via its endpoints (which would double-count back-and-forth).
+function reachAt(paths,times,pi,d,start){
+  let m=Math.min(times[pi*2]+d, times[pi*2+1]+(paths[pi].total-d));
+  if(start&&pi===start.pi) m=Math.min(m,Math.abs(d-start.d));
+  return m;
+}
+// Pure (unit-tested): snap a scene point to the nearest sampled path point
+function nearestOnPaths(paths,x,z,step){
+  let best=null;
+  paths.forEach((p,pi)=>{
+    for(let d=0;d<=p.total;d+=step){
+      const q=pointOnPath(p,d);
+      const dd=Math.hypot(q.x-x,q.z-z);
+      if(!best||dd<best.dist) best={pi,d,dist:dd};
+    }
+  });
+  return best;
+}
+function clearWalkshed(){
+  if(isoGroup){ scene.remove(isoGroup);
+    isoGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    isoGroup=null; }
+  isoMode=false;
+  $('isoBtn').innerHTML='&#128694; Walkshed';
+}
+function toggleWalkshed(){
+  if(isoGroup||isoMode){ clearWalkshed(); return; }
+  if(appState!=='city'||!geoCtx) return;
+  if(!walkPaths.length){ log('Walkshed: no walkable streets mapped here','err'); return; }
+  isoMode=true; setRouteMode(false); measureMode=false; clearMeasure();
+  $('isoBtn').innerHTML='&#128694; Click the start point&hellip;';
+  log('Walkshed: click anywhere - streets colour by walking time from there '+
+      '(green &le;5 min, yellow &le;10, orange &le;15, at 80 m/min)','ai');
+}
+function runWalkshed(pt){
+  isoMode=false;
+  const t0=performance.now();
+  const snap=nearestOnPaths(walkPaths,pt.x,pt.z,8);
+  if(!snap||snap.dist>120){
+    log('Walkshed: click closer to a street','err'); clearWalkshed(); return; }
+  const net=buildRoadNetwork(walkPaths,geoCtx.sceneW/2,geoCtx.sceneH/2);
+  const tj=buildTJunctions(walkPaths,JUNCTION_TOL);
+  const times=walkReach(walkPaths,net,snap,tj);
+  const walkToNet=snap.dist;                    // off-street approach metres
+  const bands=ISO_BANDS.map(()=>[]);
+  walkPaths.forEach((p,pi)=>{
+    for(let d=0;d<p.total;d+=6){
+      const d2=Math.min(d+6,p.total);
+      const m=Math.max(reachAt(walkPaths,times,pi,d,snap),
+                       reachAt(walkPaths,times,pi,d2,snap))+walkToNet;
+      const sec=m/WALK_SPEED;
+      const bi=ISO_BANDS.findIndex(b=>sec<=b[0]);
+      if(bi<0) continue;
+      const a=pointOnPath(p,d), b=pointOnPath(p,d2);
+      bands[bi].push(a.x,0.55,a.z,b.x,0.55,b.z);
+    }
+  });
+  isoGroup=new THREE.Group();
+  bands.forEach((arr,bi)=>{
+    if(!arr.length) return;
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(arr),3));
+    isoGroup.add(new THREE.LineSegments(g,new THREE.LineBasicMaterial({
+      color:ISO_BANDS[bi][1],transparent:true,opacity:.95})));
+  });
+  const s=new THREE.Mesh(new THREE.SphereGeometry(3,12,12),
+    new THREE.MeshBasicMaterial({color:0xffffff}));
+  s.position.set(pt.x,2,pt.z); isoGroup.add(s);
+  scene.add(isoGroup);
+  // buildings reachable per band (nearest street point + off-street legs)
+  const counts=[0,0,0]; let tot=0;
+  cityGroup.children.forEach(m=>{
+    if(!m.userData||!m.userData.lat) return;
+    tot++;
+    const x=(m.userData.lon-geoCtx.cLon)*geoCtx.mPerLon;
+    const z=(geoCtx.cLat-m.userData.lat)*M_LAT;
+    const nb=nearestOnPaths(walkPaths,x,z,12);
+    if(!nb) return;
+    const sec=(reachAt(walkPaths,times,nb.pi,nb.d,snap)+nb.dist+walkToNet)/WALK_SPEED;
+    for(let bi=0;bi<3;bi++) if(sec<=ISO_BANDS[bi][0]) counts[bi]++;
+  });
+  const ms=Math.round(performance.now()-t0);
+  window.__atlasWalkshed={counts,total:tot,ms,snapDist:+snap.dist.toFixed(1)};
+  $('isoBtn').innerHTML='&#128694; Walkshed: ON';
+  log(`Walkshed (80 m/min): ${counts[0]} buildings within 5 min, `+
+    `${counts[1]} within 10, ${counts[2]} within 15 `+
+    `(${Math.round(counts[2]/Math.max(1,tot)*100)}% of the zone) - ${ms}ms`,'ok');
+}
 function clearAnalysis(){          // on rebuild / back-to-map
   measureMode=false; clearMeasure(); clearSunAnalysis(); clearFloodSim();
+  clearWalkshed();
   $('floodRise').value=0;
 }
+window.__atlasWalkshedRun=(x,z)=>{ clearWalkshed(); runWalkshed({x,z}); };
+$('isoBtn').addEventListener('click',toggleWalkshed);
 $('measureBtn').addEventListener('click',toggleMeasure);
 $('sunBtn').addEventListener('click',runSunAnalysis);
 $('floodRise').addEventListener('input',applyFloodRise);
@@ -3615,6 +3788,11 @@ function onCanvasClick(e){
   if(measureMode){
     const hit=raycaster.intersectObject(groundMesh);
     if(hit.length) measureClick(hit[0].point);
+    return;
+  }
+  if(isoMode){
+    const hit=raycaster.intersectObject(groundMesh);
+    if(hit.length) runWalkshed(hit[0].point);
     return;
   }
   if(routeMode){
@@ -3663,7 +3841,8 @@ function hideBldCard(){
     selEdges.geometry.dispose(); selEdges.material.dispose(); selEdges=null; }
 }
 addEventListener('keydown',e=>{ if(e.key==='Escape'){ hideBldCard();
-  if(measureMode){ measureMode=false; clearMeasure(); } } });
+  if(measureMode){ measureMode=false; clearMeasure(); }
+  if(isoMode) clearWalkshed(); } });
 
 /* ---- free navigation: zoom buttons, WASD flight, double-click fly-to ---- */
 function dollyZoom(f){
