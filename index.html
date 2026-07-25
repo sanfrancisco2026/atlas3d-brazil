@@ -3272,6 +3272,75 @@ window.__atlasRoofPixelCheck=(n=30)=>{
   }
   return {vertsChecked:checked,pixelMismatches,maxIndexOffsetPx:maxIdxOff};
 };
+// street-vs-satellite superimposition validation:
+// (1) frame identity - an OSM road point mapped scene->ground-plane pixel
+//     must equal the direct lat/lon->mosaic pixel mapping;
+// (2) empirical - road CENTRELINE pixels should read as asphalt (grey,
+//     low-chroma) far more often than points offset 15m sideways; that
+//     tests the actual Esri-vs-OSM source georegistration, not just our
+//     internal math.
+window.__atlasOverlayCheck=(n=400)=>{
+  if(!geoCtx||!satData||!trafficPaths.length) return null;
+  const {sceneW,sceneH}=geoCtx;
+  const pixAt=(x,z)=>({
+    px:Math.min(satData.w-1,Math.max(0,Math.floor((x/sceneW+0.5)*satData.w))),
+    py:Math.min(satData.h-1,Math.max(0,Math.floor((z/sceneH+0.5)*satData.h)))});
+  const isGrey=(px,py)=>{
+    const i=(py*satData.w+px)*4, d=satData.imgData.data;
+    const mx=Math.max(d[i],d[i+1],d[i+2]), mn=Math.min(d[i],d[i+1],d[i+2]);
+    return (mx-mn)<38&&mx>40&&mx<215;     // asphalt-grey band, raw pixels
+  };
+  const inZone=(x,z)=>Math.abs(x)<sceneW/2-2&&Math.abs(z)<sceneH/2-2;
+  const pts=[];
+  for(const p of trafficPaths)
+    for(let d=8;d<p.total-8&&pts.length<n;d+=22){
+      const q=pointOnPath(p,d);
+      if(inZone(q.x,q.z)) pts.push(q);
+    }
+  // (1) frame identity: OSM point -> scene -> ground pixel must equal the
+  //     direct lat/lon -> mosaic pixel (in-zone points only; OSM ways
+  //     legitimately run past the capture box)
+  let maxIdx=0;
+  for(const q of pts){
+    const ll=sceneToLatLon(q.x,q.z);
+    const du=Math.floor((ll.lon-geoCtx.W)/(geoCtx.E-geoCtx.W)*satData.w);
+    const dv=Math.floor((1-(ll.lat-geoCtx.S)/(geoCtx.N-geoCtx.S))*satData.h);
+    const g=pixAt(q.x,q.z);
+    maxIdx=Math.max(maxIdx,Math.abs(du-g.px),Math.abs(dv-g.py));
+  }
+  // (2) registration shift-scan. Two independent signals per lateral
+  //     shift of the whole sampled road set:
+  //     - asphalt%: grey-band hit rate (weak where canopy covers roads)
+  //     - roughness: mean colour change between consecutive along-road
+  //       samples - the true centreline follows a homogeneous asphalt
+  //       ribbon, so roughness should be LOWEST at shift 0.
+  //     If OSM and the imagery are superimposed, 0 wins; a systematic
+  //     source offset would move both optima the same way.
+  const shifts=[-20,-15,-10,-5,0,5,10,15,20], grey=[], rough=[];
+  const rgbAt=(x,z)=>{ const g=pixAt(x,z), i=(g.py*satData.w+g.px)*4,
+    d=satData.imgData.data; return [d[i],d[i+1],d[i+2]]; };
+  for(const s of shifts){
+    let gc=0, rSum=0, rN=0, prev=null;
+    for(const q of pts){
+      const nx=Math.cos(q.yaw), nz=-Math.sin(q.yaw);
+      const px=q.x+nx*s, pz=q.z+nz*s;
+      const g=pixAt(px,pz);
+      if(isGrey(g.px,g.py)) gc++;
+      const c=rgbAt(px,pz);
+      if(prev&&Math.hypot(q.x-prev.x,q.z-prev.z)<30){   // same-way neighbour
+        rSum+=Math.abs(c[0]-prev.c[0])+Math.abs(c[1]-prev.c[1])+Math.abs(c[2]-prev.c[2]);
+        rN++;
+      }
+      prev={x:q.x,z:q.z,c};
+    }
+    grey.push(+(gc/Math.max(1,pts.length)*100).toFixed(1));
+    rough.push(+(rSum/Math.max(1,rN)).toFixed(1));
+  }
+  return {roadPtsChecked:pts.length, frameMaxPxOff:maxIdx,
+    shifts,
+    asphaltPct:grey, bestAsphaltShiftM:shifts[grey.indexOf(Math.max(...grey))],
+    roughness:rough, smoothestShiftM:shifts[rough.indexOf(Math.min(...rough))]};
+};
 // roof fidelity: recompute every cap vertex's expected satellite UV from
 // its world position and report the worst deviation + mosaic sharpness
 window.__atlasRoofCheck=(n=40)=>{
