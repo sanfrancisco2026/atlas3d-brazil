@@ -257,3 +257,7 @@ No required API keys. All backing services are free/public:
   is specifically about reshaping the dataset format.
 - Update this file's Architecture/Credentials sections whenever an iteration
   changes how the app is structured or what it depends on.
+- **Push after every commit** (user request, 2026-07-25): `origin` is
+  `https://github.com/sanfrancisco2026/atlas3d-brazil.git` and this machine's
+  stored (androidfanatic) credential has collaborator access — run `git push`
+  immediately after each commit so GitHub always mirrors local master.
