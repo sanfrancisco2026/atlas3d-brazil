@@ -1672,6 +1672,91 @@ function medianNearbyHeight(neigh,x,z,R,fallback){
   return hs.length>=3?hs[hs.length>>1]:fallback;
 }
 
+/* ---- off-nadir roof-lean correction ----
+   Esri imagery in flagship US cities is TRUE ortho (roofs sit exactly
+   on footprints - e.g. Manhattan); elsewhere it is standard ortho, so
+   tall buildings' photographed ROOFS are displaced sideways from their
+   ground footprints by the camera's off-nadir angle. We estimate the
+   zone's lean vector (metres of roof shift per metre of height) from
+   its own towers - the vector that puts every tower's sampling points
+   on the most homogeneous image patch (its actual roof) - then sample
+   rooftop caps at the LEANED position, pulling each photographed roof
+   back onto its true footprint. */
+let satLean={x:0,z:0};
+// Pure (unit-tested): two-stage grid argmin over lean candidates
+// (coarse 0.05 steps to +/-0.55 m/m ~ 29deg off-nadir, then 0.01 fine)
+function scanLean(scoreFn){
+  let best={lx:0,lz:0,sc:scoreFn(0,0)};
+  const s0=best.sc;
+  for(let lx=-0.55;lx<=0.551;lx+=0.05)for(let lz=-0.55;lz<=0.551;lz+=0.05){
+    const sc=scoreFn(lx,lz); if(sc<best.sc) best={lx,lz,sc};
+  }
+  const c={lx:best.lx,lz:best.lz};
+  for(let lx=c.lx-0.04;lx<=c.lx+0.041;lx+=0.01)
+    for(let lz=c.lz-0.04;lz<=c.lz+0.041;lz+=0.01){
+      const sc=scoreFn(lx,lz); if(sc<best.sc) best={lx,lz,sc};
+    }
+  return {s0,best};
+}
+// Pure (unit-tested): adopt only a CLEAR improvement over no-lean, and
+// only a non-trivial vector - otherwise the imagery is true-ortho and
+// noise-chasing would smear correct roofs
+function acceptLean(s0,best){
+  return best.sc<s0*0.9&&Math.hypot(best.lx,best.lz)>=0.02;
+}
+function estimateRoofLean(prepared){
+  satLean={x:0,z:0};
+  if(!satData||!geoCtx) return;
+  const {sceneW,sceneH,cLat,cLon,mPerLon}=geoCtx;
+  const towers=prepared.filter(p=>!p.isSyn&&(p.finalH||p.typologyH)>=18)
+    .sort((a,b)=>(b.finalH||b.typologyH)-(a.finalH||a.typologyH)).slice(0,30);
+  if(towers.length<6){
+    log('Ortho-lean: too few tall buildings here to estimate roof displacement - sampling roofs at the footprint','ai');
+    return;
+  }
+  const d=satData.imgData.data;                     // RAW pixels
+  const lumAt=(x,z)=>{
+    const u=x/sceneW+0.5, v=z/sceneH+0.5;
+    if(u<0||u>=1||v<0||v>=1) return null;
+    const i=(Math.floor(v*satData.h)*satData.w+Math.floor(u*satData.w))*4;
+    return 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+  };
+  const T=towers.map(t=>{
+    const cx=(t.sLon-cLon)*mPerLon, cz=(cLat-t.sLat)*M_LAT;
+    const pts=[[cx,cz]];
+    const step=Math.max(1,Math.ceil(t.pts.length/8));
+    for(let i=0;i<t.pts.length;i+=step)
+      pts.push([cx+(t.pts[i].x-cx)*0.45, cz+(t.pts[i].y-cz)*0.45]);
+    return {pts,h:t.finalH||t.typologyH};
+  });
+  const score=(lx,lz)=>{             // mean per-tower luminance variance
+    let sum=0,n=0;
+    for(const t of T){
+      let s=0,s2=0,k=0;
+      for(const [x,z] of t.pts){
+        const L=lumAt(x+lx*t.h, z+lz*t.h);
+        if(L==null) continue;
+        s+=L; s2+=L*L; k++;
+      }
+      if(k>=4){ sum+=s2/k-(s/k)*(s/k); n++; }
+    }
+    return n?sum/n:1e9;
+  };
+  const {s0,best}=scanLean(score);
+  window.__atlasLeanStats={towers:T.length,score0:Math.round(s0),
+    score:Math.round(best.sc),lx:+best.lx.toFixed(3),lz:+best.lz.toFixed(3),
+    adopted:acceptLean(s0,best)};
+  if(acceptLean(s0,best)){
+    satLean={x:best.lx,z:best.lz};
+    const az=((Math.atan2(best.lx,-best.lz)*180/Math.PI)+360)%360;
+    log(`Ortho-lean correction: roofs displaced ${Math.hypot(best.lx,best.lz).toFixed(2)}m `+
+      `per metre of height toward ${Math.round(az)}deg (estimated from ${T.length} towers, `+
+      `roof-patch variance ${Math.round(s0)}->${Math.round(best.sc)}) - rooftop sampling corrected`,'ai');
+  }else{
+    log('Ortho-lean: no significant roof displacement detected - imagery is effectively true-ortho here','ai');
+  }
+}
+
 // Segment unmapped roofs from the RAW satellite pixels and return
 // prepared-entry footprints for the extruder. Excluded from candidates:
 // vegetation (green mask test), real footprints (dilated 1 cell), and
@@ -1892,6 +1977,10 @@ function buildBuildings(osm){
       .forEach(s=>prepared.push(s));
   }catch(e){ log('Roof-detection infill failed: '+e.message,'err'); }
 
+  // ---- off-nadir lean estimation (rooftop sampling correction) ----
+  try{ estimateRoofLean(prepared); }
+  catch(e){ satLean={x:0,z:0}; log('Ortho-lean estimation failed: '+e.message,'err'); }
+
   // ---- pass 2: extrude ----
   let count=0, tallest=0, tagged=0, synCount=0, synDropped=0;
   prepared.forEach(p=>{
@@ -1925,10 +2014,16 @@ function buildBuildings(osm){
       const k1=ek(A.x,A.y), k2=ek(B.x,B.y);
       edgeWin.set(k1<k2?k1+'|'+k2:k2+'|'+k1,windowCols(len));
     }
+    // rooftop sampling position: leaned by height for REAL buildings so
+    // the photographed (displaced) roof lands back on its footprint.
+    // Detected-roof synthetics are traced AT the photographed position,
+    // so their caps sample unshifted.
+    const leanX=p.isSyn?0:satLean.x*h, leanZ=p.isSyn?0:satLean.z*h;
     for(const g of geom.groups){
       if(g.materialIndex===0){                      // caps: satellite
         for(let i=g.start;i<g.start+g.count;i++)
-          uv.setXY(i,(pos.getX(i)+halfW)/sceneW,1-(pos.getZ(i)+halfH)/sceneH);
+          uv.setXY(i,(pos.getX(i)+leanX+halfW)/sceneW,
+                     1-(pos.getZ(i)+leanZ+halfH)/sceneH);
         continue;
       }
       // side quads: each triangle spans exactly one footprint edge (two
@@ -1980,7 +2075,7 @@ function buildBuildings(osm){
     if(ring.length>1&&Math.hypot(ring[0][0]-ring[ring.length-1][0],
        ring[0][1]-ring[ring.length-1][1])<1e-6) ring.pop();
     mesh.userData={h,minH,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
-      area:Math.round(p.area), ring,
+      area:Math.round(p.area), ring, leanX, leanZ,
       src:p.tagged?(p.tags['lidar:height']?'lidar':(p.tags['ms:footprint']?'ms':'osm'))
          :(p.shadow?'shadow':'typo')};   // height provenance
 
@@ -3491,8 +3586,9 @@ window.__atlasRoofPixelCheck=(n=30)=>{
     const cap=g&&g.groups&&g.groups.find(x=>x.materialIndex===0);
     if(!cap||!g.attributes.uv) continue;
     const pos=g.attributes.position, uv=g.attributes.uv;
+    const lx=m.userData.leanX||0, lz=m.userData.leanZ||0;  // ortho-lean shift
     for(let i=cap.start;i<Math.min(cap.start+12,cap.start+cap.count);i++){
-      const ll=sceneToLatLon(pos.getX(i),pos.getZ(i));
+      const ll=sceneToLatLon(pos.getX(i)+lx,pos.getZ(i)+lz);
       const mx=Math.min(satData.w-1,Math.floor((ll.lon-geoCtx.W)/(geoCtx.E-geoCtx.W)*satData.w));
       const my=Math.min(satData.h-1,Math.floor((1-(ll.lat-geoCtx.S)/(geoCtx.N-geoCtx.S))*satData.h));
       const rx=Math.min(satData.w-1,Math.floor(uv.getX(i)*satData.w));
@@ -3583,8 +3679,10 @@ window.__atlasRoofCheck=(n=40)=>{
     const g=m.geometry; if(!g||!g.groups||!g.attributes.uv) continue;
     const pos=g.attributes.position, uv=g.attributes.uv;
     const cap=g.groups.find(x=>x.materialIndex===0); if(!cap) continue;
+    const lx=m.userData.leanX||0, lz=m.userData.leanZ||0;  // ortho-lean shift
     for(let i=cap.start;i<cap.start+cap.count;i++){
-      const eu=(pos.getX(i)+sceneW/2)/sceneW, ev=1-(pos.getZ(i)+sceneH/2)/sceneH;
+      const eu=(pos.getX(i)+lx+sceneW/2)/sceneW;
+      const ev=1-(pos.getZ(i)+lz+sceneH/2)/sceneH;
       out.maxErr=Math.max(out.maxErr,
         Math.abs(uv.getX(i)-eu),Math.abs(uv.getY(i)-ev));
     }
