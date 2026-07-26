@@ -841,10 +841,13 @@ function localOSM(b){
   };
   a.b.forEach(([typ,ring,syn])=>{
     if(!inBox(ring)) return;
+    // dataset synthetic boxes are no longer used - synthetic infill is
+    // now traced from roofs DETECTED in the satellite image instead
+    // (detectRoofInfill in buildBuildings)
+    if(syn) return;
     const w={type:'way',id:wid++,nodes:ring.map(([lat,lon])=>addNode(lat,lon)),
       tags:{building:typ||'yes'}};
-    if(syn) w.tags['atlas:synthetic']='1';
-    else applyLidar(w,ring);
+    applyLidar(w,ring);
     data.waysById[w.id]=w; data.elements.push(w);
   });
   // Microsoft ML footprints: standardized polygons filling gaps where OSM
@@ -1562,6 +1565,227 @@ function footprintOnRoad(poly,samples){
   return samples.some(s=>pointInPoly(poly,s.x,s.y)||distToPolyEdge(poly,s.x,s.y)<s.hw);
 }
 
+/* ---- roof detection for synthetic infill ----
+   Unmapped buildings are not invented as random boxes: the raw satellite
+   pixels are segmented against the COLOUR PALETTE of the zone's real
+   mapped roofs, each detected region's border is traced and simplified,
+   and that border becomes the synthetic footprint - extruded at the
+   neighbourhood's median mapped height. */
+// Pure (unit-tested): quantized (5-bit) colour palette of mapped roofs
+function roofPaletteFrom(samples,topN){
+  const hist=new Map();
+  samples.forEach(([r,g,b])=>{
+    const k=(r>>5)+','+(g>>5)+','+(b>>5);
+    hist.set(k,(hist.get(k)||0)+1);
+  });
+  return new Set([...hist.entries()].sort((a,b)=>b[1]-a[1])
+    .slice(0,topN).map(e=>e[0]));
+}
+// Pure (unit-tested): colour inside (or adjacent to) a palette bucket
+function matchesRoofPalette(pal,r,g,b){
+  const qr=r>>5, qg=g>>5, qb=b>>5;
+  for(let dr=-1;dr<=1;dr++)for(let dg=-1;dg<=1;dg++)for(let db=-1;db<=1;db++)
+    if(pal.has((qr+dr)+','+(qg+dg)+','+(qb+db))) return true;
+  return false;
+}
+// Pure (unit-tested): 4-connected components of a binary grid, kept when
+// their cell count is within [minCells, maxCells]
+function gridComponents(mask,W,H,minCells,maxCells){
+  const seen=new Uint8Array(W*H), out=[];
+  for(let i=0;i<W*H;i++){
+    if(!mask[i]||seen[i]) continue;
+    const q=[i]; seen[i]=1; const cells=[];
+    while(q.length){
+      const c=q.pop(); cells.push(c);
+      const x=c%W, y=(c/W)|0;
+      if(x+1<W&&mask[c+1]&&!seen[c+1]){ seen[c+1]=1; q.push(c+1); }
+      if(x>0&&mask[c-1]&&!seen[c-1]){ seen[c-1]=1; q.push(c-1); }
+      if(y+1<H&&mask[c+W]&&!seen[c+W]){ seen[c+W]=1; q.push(c+W); }
+      if(y>0&&mask[c-W]&&!seen[c-W]){ seen[c-W]=1; q.push(c-W); }
+    }
+    if(cells.length>=minCells&&cells.length<=maxCells) out.push(cells);
+  }
+  return out;
+}
+// Pure (unit-tested): outer boundary of a component as a ring of grid
+// corners - directed boundary edges (inside kept on the left) chained
+// into a loop. Returns null if the chain does not close cleanly.
+function traceOutline(cells,W){
+  const inSet=new Set(cells);
+  const has=(x,y)=>x>=0&&y>=0&&inSet.has(y*W+x);
+  const nxt=new Map();
+  const add=(k,v)=>{ if(!nxt.has(k)) nxt.set(k,[]); nxt.get(k).push(v); };
+  let sx=Infinity, sy=Infinity;
+  cells.forEach(c=>{ const x=c%W, y=(c/W)|0;
+    if(y<sy||(y===sy&&x<sx)){ sx=x; sy=y; }
+    if(!has(x,y-1)) add(x+','+y,[x+1,y]);            // top edge  -> E
+    if(!has(x+1,y)) add((x+1)+','+y,[x+1,y+1]);      // right     -> S
+    if(!has(x,y+1)) add((x+1)+','+(y+1),[x,y+1]);    // bottom    -> W
+    if(!has(x-1,y)) add(x+','+(y+1),[x,y]);          // left      -> N
+  });
+  const start=[sx,sy], ring=[];
+  let cur=start, guard=cells.length*8+16;
+  do{
+    ring.push(cur);
+    const arr=nxt.get(cur[0]+','+cur[1]);
+    if(!arr||!arr.length) return null;
+    cur=arr.pop();
+  }while((cur[0]!==start[0]||cur[1]!==start[1])&&guard-->0);
+  return guard>0?ring:null;
+}
+// Pure (unit-tested): Douglas-Peucker on a closed ring. GLOBAL tolerance
+// - unlike iterative neighbour-dropping, the simplified border never
+// drifts more than eps from the traced outline, however long the ring
+// (naive iterative removal collapsed big raster blobs into slivers).
+function simplifyRing(ring,eps){
+  const N=ring.length;
+  if(N<=4) return ring.slice();
+  const dseg=(p,a,b)=>{
+    const dx=b[0]-a[0], dy=b[1]-a[1], L2=dx*dx+dy*dy;
+    const t=L2?clamp(((p[0]-a[0])*dx+(p[1]-a[1])*dy)/L2,0,1):0;
+    return Math.hypot(p[0]-(a[0]+dx*t),p[1]-(a[1]+dy*t));
+  };
+  const keep=new Set([0]);
+  const dp=(pts,i0,i1)=>{
+    if(i1-i0<2) return;
+    let mx=-1, mi=-1;
+    for(let i=i0+1;i<i1;i++){
+      const d=dseg(pts[i],pts[i0],pts[i1]);
+      if(d>mx){ mx=d; mi=i; }
+    }
+    if(mx>eps){ dp(pts,i0,mi); keep.add(mi%N); dp(pts,mi,i1); }
+  };
+  let far=0, mx=-1;                        // anchor: farthest point from 0
+  for(let i=1;i<N;i++){
+    const d=Math.hypot(ring[i][0]-ring[0][0],ring[i][1]-ring[0][1]);
+    if(d>mx){ mx=d; far=i; }
+  }
+  keep.add(far);
+  dp(ring,0,far);
+  dp(ring.concat([ring[0]]),far,N);        // wrap-around half
+  return ring.filter((_,i)=>keep.has(i));
+}
+// Pure (unit-tested): median mapped height near a point, with fallback
+function medianNearbyHeight(neigh,x,z,R,fallback){
+  const hs=neigh.filter(n=>Math.hypot(n.x-x,n.z-z)<=R)
+    .map(n=>n.h).sort((a,b)=>a-b);
+  return hs.length>=3?hs[hs.length>>1]:fallback;
+}
+
+// Segment unmapped roofs from the RAW satellite pixels and return
+// prepared-entry footprints for the extruder. Excluded from candidates:
+// vegetation (green mask test), real footprints (dilated 1 cell), and
+// every road corridor. Needs >=20 mapped roofs to learn a palette from.
+function detectRoofInfill(prepared,roadSamples){
+  if(!satData||!geoCtx) return [];
+  const {sceneW,sceneH,cLat,cLon,mPerLon}=geoCtx;
+  const CS=2, W=Math.floor(sceneW/CS), H=Math.floor(sceneH/CS);
+  if(W<10||H<10) return [];
+  const d=satData.imgData.data;                 // RAW pixels (pre-enhance)
+  const rawAt=(gx,gy)=>{
+    const px=Math.min(satData.w-1,Math.floor((gx+0.5)/W*satData.w));
+    const py=Math.min(satData.h-1,Math.floor((gy+0.5)/H*satData.h));
+    const i=(py*satData.w+px)*4; return [d[i],d[i+1],d[i+2]];
+  };
+  // palette learned from the zone's REAL mapped roofs
+  const roofSamples=[];
+  prepared.forEach(p=>{
+    if(p.isSyn) return;
+    const x=(p.sLon-cLon)*mPerLon, z=(cLat-p.sLat)*M_LAT;
+    const gx=Math.floor((x/sceneW+0.5)*W), gy=Math.floor((z/sceneH+0.5)*H);
+    if(gx<1||gy<1||gx>=W-1||gy>=H-1) return;
+    roofSamples.push(rawAt(gx,gy));
+  });
+  if(roofSamples.length<20) return [];
+  const pal=roofPaletteFrom(roofSamples,12);
+  const mask=new Uint8Array(W*H);
+  for(let gy=0;gy<H;gy++)for(let gx=0;gx<W;gx++){
+    const [r,g,b]=rawAt(gx,gy);
+    if(isVegetated(r,g,b)) continue;
+    if(matchesRoofPalette(pal,r,g,b)) mask[gy*W+gx]=1;
+  }
+  // split touching roofs at colour boundaries: a cell whose colour jumps
+  // hard vs its right/down neighbour is a border between two surfaces -
+  // clearing it separates adjacent buildings into distinct components
+  const jump=(a,b)=>Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1])+Math.abs(a[2]-b[2]);
+  const cut=[];
+  for(let gy=0;gy<H-1;gy++)for(let gx=0;gx<W-1;gx++){
+    if(!mask[gy*W+gx]) continue;
+    const c=rawAt(gx,gy);
+    if(jump(c,rawAt(gx+1,gy))>60||jump(c,rawAt(gx,gy+1))>60)
+      cut.push(gy*W+gx);
+  }
+  cut.forEach(i=>mask[i]=0);
+  // knock out real footprints (dilated one cell)...
+  prepared.forEach(p=>{
+    if(p.isSyn) return;
+    const poly=p.pts.map(v=>({x:v.x,y:v.y}));
+    let x0=1/0,x1=-1/0,z0=1/0,z1=-1/0;
+    p.pts.forEach(v=>{ x0=Math.min(x0,v.x); x1=Math.max(x1,v.x);
+                       z0=Math.min(z0,v.y); z1=Math.max(z1,v.y); });
+    const gx0=Math.max(0,Math.floor((x0/sceneW+0.5)*W)-1);
+    const gx1=Math.min(W-1,Math.ceil((x1/sceneW+0.5)*W)+1);
+    const gz0=Math.max(0,Math.floor((z0/sceneH+0.5)*H)-1);
+    const gz1=Math.min(H-1,Math.ceil((z1/sceneH+0.5)*H)+1);
+    for(let gy=gz0;gy<=gz1;gy++)for(let gx=gx0;gx<=gx1;gx++){
+      const px=(gx+0.5)/W*sceneW-sceneW/2, pz=(gy+0.5)/H*sceneH-sceneH/2;
+      if(pointInPoly(poly,px,pz)||distToPolyEdge(poly,px,pz)<CS)
+        mask[gy*W+gx]=0;
+    }
+  });
+  // ...and every road corridor
+  for(const s of roadSamples){
+    const R=s.hw+1.5;
+    const gx0=Math.max(0,Math.floor(((s.x-R)/sceneW+0.5)*W));
+    const gx1=Math.min(W-1,Math.ceil(((s.x+R)/sceneW+0.5)*W));
+    const gz0=Math.max(0,Math.floor(((s.y-R)/sceneH+0.5)*H));
+    const gz1=Math.min(H-1,Math.ceil(((s.y+R)/sceneH+0.5)*H));
+    for(let gy=gz0;gy<=gz1;gy++)for(let gx=gx0;gx<=gx1;gx++) mask[gy*W+gx]=0;
+  }
+  // components -> traced borders -> footprints at neighbourhood heights
+  let maskCells=0; for(let i=0;i<W*H;i++) if(mask[i]) maskCells++;
+  const comps=gridComponents(mask,W,H,Math.ceil(40/(CS*CS)),Math.floor(3600/(CS*CS)));
+  const compsAll=gridComponents(mask,W,H,1,1e9);   // diagnostics only
+  window.__atlasRoofInfillStats={grid:W+'x'+H,maskCells,
+    components:compsAll.length,inRange:comps.length,
+    biggest:compsAll.length?Math.max(...compsAll.map(c=>c.length)):0,
+    rejects:null,sampleAreas:[]};   // filled below
+  const neigh=prepared.filter(p=>!p.isSyn).map(p=>({
+    x:(p.sLon-cLon)*mPerLon, z:(cLat-p.sLat)*M_LAT, h:p.finalH||p.typologyH}));
+  const out=[], rej={trace:0,complex:0,area:0};
+  comps.sort((a,b)=>b.length-a.length).slice(0,350).forEach((cells,ci)=>{
+    const ringG=traceOutline(cells,W);
+    if(!ringG||ringG.length<4){ rej.trace++; return; }
+    const ring=simplifyRing(ringG,1.25).map(([gx,gy])=>
+      [gx/W*sceneW-sceneW/2, gy/H*sceneH-sceneH/2]);
+    if(ring.length<3||ring.length>40){ rej.complex++; return; }
+    const pts=ring.map(([x,z])=>new THREE.Vector2(x,z));
+    pts.push(pts[0].clone());
+    let area=0;
+    for(let i=0;i<pts.length-1;i++) area+=pts[i].x*pts[i+1].y-pts[i+1].x*pts[i].y;
+    area=Math.abs(area)/2;
+    if(window.__atlasRoofInfillStats.sampleAreas.length<8)
+      window.__atlasRoofInfillStats.sampleAreas.push(
+        {cells:cells.length,ringPts:ring.length,area:Math.round(area)});
+    if(area<35||area>2600){ rej.area++; return; }
+    let cx=0,cz=0; ring.forEach(([x,z])=>{ cx+=x; cz+=z; });
+    cx/=ring.length; cz/=ring.length;
+    const h=medianNearbyHeight(neigh,cx,cz,160,4.5);
+    out.push({ id:900000+ci, tags:{'atlas:synthetic':'1'},
+      pts, area, sLat:cLat-cz/M_LAT, sLon:cLon+cx/mPerLon,
+      radius:Math.sqrt(area/Math.PI), typologyH:h, finalH:h,
+      tagged:false, knownH:0, minH:0, rand:mulberry32((900000+ci)>>>0),
+      isSyn:true });
+  });
+  window.__atlasRoofInfillStats.rejects=rej;
+  window.__atlasRoofInfillStats.emitted=out.length;
+  if(out.length)
+    log(`Roof detection: ${out.length} synthetic footprints traced from `+
+      `unmapped satellite roofs (palette learned from ${roofSamples.length} `+
+      `mapped roofs; vegetation/roads/footprints excluded)`,'ai');
+  return out;
+}
+
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
   // reset any Mapillary-reference tint from the previous zone
@@ -1658,6 +1882,15 @@ function buildBuildings(osm){
     }
     log(`Shadow model: sun elev ~${model.elevDeg.toFixed(0)}deg, ${model.n} OSM control pts (r=${model.corr.toFixed(2)})`,'ai');
   }
+
+  // ---- synthetic infill from DETECTED ROOFS ----
+  // no invented boxes: unmapped roofs are segmented from the satellite
+  // image (colour-matched to the zone's real mapped roofs) and their
+  // traced borders become the synthetic footprints
+  try{
+    detectRoofInfill(prepared,[...rsMap.values()].flat())
+      .forEach(s=>prepared.push(s));
+  }catch(e){ log('Roof-detection infill failed: '+e.message,'err'); }
 
   // ---- pass 2: extrude ----
   let count=0, tallest=0, tagged=0, synCount=0, synDropped=0;
@@ -1776,7 +2009,7 @@ function buildBuildings(osm){
   $('stCoverage').textContent=real?Math.round(tagged/real*100)+'%':'0%';
   $('synBtn').style.display=synCount?'block':'none';
   log(`Extruded ${real} real footprints (${tagged} OSM z-tagged`+(refined?`, ${refined} shadow-estimated`:'')+`)`,'ok');
-  if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (procedural, landuse-derived)`,'ai');
+  if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (borders traced from satellite roof detection)`,'ai');
   if(synDropped) log(`- ${synDropped} synthetic footprints dropped (overlapped a road corridor)`,'ai');
 }
 

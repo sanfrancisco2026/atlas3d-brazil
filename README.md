@@ -23,7 +23,10 @@ the module script.)
   (OSM tags → São Paulo PMSP LiDAR → satellite shadow-length model →
   typology), Microsoft ML footprints filling OSM gaps, procedural facade
   families (4 glazed-glass + masonry + concrete) with architecture-aligned
-  window grids and animated night windows.
+  window grids and animated night windows. Remaining unmapped buildings are
+  not invented: their roofs are **detected in the satellite image** (colour
+  palette learned from the zone's real mapped roofs), each region's border
+  traced and simplified, and extruded at the neighbourhood's median height.
 - **Pixel-true rooftops** — every roof shows exactly the vertical satellite
   image over its footprint; mosaic geo-registration is verified sub-pixel by
   built-in audit hooks (`__atlasGeoCheck`, `__atlasRoofPixelCheck`).
