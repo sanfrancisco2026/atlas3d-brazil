@@ -3550,6 +3550,36 @@ window.__atlasFacadeStats=()=>{ const c={};
   return c; };
 window.__atlasGlowState=()=>facadeAnim.map(f=>f.lit.size);
 window.__atlasGlowTick=dt=>facadeGlowTick(dt);
+// demo/verification frame capture: force a synchronous render and hand
+// the frame to a local collector if one is listening (no-op otherwise)
+window.__atlasShot=async name=>{
+  composer.render();
+  const url=renderer.domElement.toDataURL('image/jpeg',0.92);
+  try{
+    await fetch('http://localhost:5190/save?name='+encodeURIComponent(name),
+      {method:'POST',body:url});
+    return 'saved '+name;
+  }catch(e){ return 'collector offline'; }
+};
+// title/section cards for the demo reel, rendered off-DOM
+window.__atlasCard=async(name,title,lines)=>{
+  const c=document.createElement('canvas'); c.width=1600; c.height=900;
+  const x=c.getContext('2d');
+  x.fillStyle='#0b0f16'; x.fillRect(0,0,1600,900);
+  x.fillStyle='#4facfe'; x.fillRect(120,300,10,90);
+  x.fillStyle='#eef4ff'; x.font='700 68px Segoe UI,Arial';
+  x.fillText(title,160,365);
+  x.font='30px Segoe UI,Arial'; x.fillStyle='#93a3bc';
+  (lines||[]).forEach((l,i)=>x.fillText(l,160,440+i*48));
+  x.font='24px Segoe UI,Arial'; x.fillStyle='#3d4a5f';
+  x.fillText('ATLAS-3D',160,830);
+  const url=c.toDataURL('image/jpeg',0.92);
+  try{
+    await fetch('http://localhost:5190/save?name='+encodeURIComponent(name),
+      {method:'POST',body:url});
+    return 'saved '+name;
+  }catch(e){ return 'collector offline'; }
+};
 // geo-registration audit: for a 9x9 lat/lon grid over the current zone,
 // compare the canvas pixel every consumer's linear mapping produces
 // against the true Web-Mercator pixel the stitcher put there
