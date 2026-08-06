@@ -85,6 +85,33 @@ function simplifyRing(ring,eps){
   dp(ring.concat([ring[0]]),far,N);
   return ring.filter((_,i)=>keep.has(i));
 }
+function convexHullPts(pts){
+  const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  if(p.length<3) return p;
+  const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lo=[], hi=[];
+  for(const q of p){
+    while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],q)<=0) lo.pop();
+    lo.push(q);
+  }
+  for(let i=p.length-1;i>=0;i--){
+    const q=p[i];
+    while(hi.length>=2&&cross(hi[hi.length-2],hi[hi.length-1],q)<=0) hi.pop();
+    hi.push(q);
+  }
+  lo.pop(); hi.pop();
+  return lo.concat(hi);
+}
+function ringSolidity(ring){
+  const A=r=>{ let a=0;
+    for(let i=0;i<r.length;i++){ const p=r[i], q=r[(i+1)%r.length];
+      a+=p[0]*q[1]-q[0]*p[1]; }
+    return Math.abs(a)/2; };
+  const hull=convexHullPts(ring);
+  if(hull.length<3) return 0;
+  const ha=A(hull);
+  return ha>0?A(ring)/ha:0;
+}
 function medianNearbyHeight(neigh,x,z,R,fallback){
   const hs=neigh.filter(n=>Math.hypot(n.x-x,n.z-z)<=R)
     .map(n=>n.h).sort((a,b)=>a-b);
@@ -141,6 +168,18 @@ const bigRing=simplifyRing(traceOutline(big,W2),1.25);
 check('large rectangle (600 cells, 100-corner trace) keeps 4 corners and full area',
   bigRing.length===4&&Math.abs(shoelace(bigRing)-600)<1e-9,
   bigRing.length+' pts, area '+shoelace(bigRing));
+
+console.log('=== roof-likeness (solidity) gate ===');
+check('rectangle scores 1.0',
+  Math.abs(ringSolidity([[0,0],[12,0],[12,8],[0,8]])-1)<1e-9);
+check('L-shape ~0.71 - real building shapes pass the 0.7 gate',
+  (()=>{ const s=ringSolidity([[0,0],[3,0],[3,1],[1,1],[1,3],[0,3]]);
+    return Math.abs(s-5/7)<1e-9&&s>=0.7; })());
+check('ragged star (soil/clearing-like) rejected by the gate',
+  (()=>{ const star=[]; for(let k=0;k<12;k++){ const a=k*Math.PI/6,
+      r=k%2?1:4; star.push([Math.cos(a)*r,Math.sin(a)*r]); }
+    return ringSolidity(star)<0.7; })());
+check('degenerate ring scores 0', ringSolidity([[0,0],[5,0]])===0);
 
 console.log('=== neighbourhood height ===');
 const nb=[{x:0,z:0,h:4},{x:10,z:0,h:6},{x:20,z:0,h:9},{x:500,z:500,h:60}];

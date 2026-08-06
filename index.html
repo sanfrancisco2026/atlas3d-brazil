@@ -418,7 +418,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
 
     <button id="routeBtn" class="gold" style="margin-top:14px">&#9673; Plot Route (OSRM)</button>
     <div id="routeInfo"></div>
-    <button id="synBtn" class="ghost" style="display:none">Synthetic infill: ON</button>
+    <button id="synBtn" class="ghost" style="display:none">Synthetic infill: OFF</button>
     <div class="btn-row">
       <button id="shotBtn" class="ghost">&#128247; Postcard</button>
       <button id="glbBtn" class="ghost">&#11015; 3D model (.glb)</button>
@@ -1665,6 +1665,37 @@ function simplifyRing(ring,eps){
   dp(ring.concat([ring[0]]),far,N);        // wrap-around half
   return ring.filter((_,i)=>keep.has(i));
 }
+// Pure (unit-tested): convex hull (Andrew monotone chain) of [x,z] pts
+function convexHullPts(pts){
+  const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  if(p.length<3) return p;
+  const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lo=[], hi=[];
+  for(const q of p){
+    while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],q)<=0) lo.pop();
+    lo.push(q);
+  }
+  for(let i=p.length-1;i>=0;i--){
+    const q=p[i];
+    while(hi.length>=2&&cross(hi[hi.length-2],hi[hi.length-1],q)<=0) hi.pop();
+    hi.push(q);
+  }
+  lo.pop(); hi.pop();
+  return lo.concat(hi);
+}
+// Pure (unit-tested): ring area / convex-hull area. Buildings are compact
+// (rectangles 1.0, L-shapes ~0.71); ragged soil or vegetation patches
+// that happen to match roof colours score far lower and are rejected.
+function ringSolidity(ring){
+  const A=r=>{ let a=0;
+    for(let i=0;i<r.length;i++){ const p=r[i], q=r[(i+1)%r.length];
+      a+=p[0]*q[1]-q[0]*p[1]; }
+    return Math.abs(a)/2; };
+  const hull=convexHullPts(ring);
+  if(hull.length<3) return 0;
+  const ha=A(hull);
+  return ha>0?A(ring)/ha:0;
+}
 // Pure (unit-tested): median mapped height near a point, with fallback
 function medianNearbyHeight(neigh,x,z,R,fallback){
   const hs=neigh.filter(n=>Math.hypot(n.x-x,n.z-z)<=R)
@@ -1708,9 +1739,14 @@ function estimateRoofLean(prepared){
   satLean={x:0,z:0};
   if(!satData||!geoCtx) return;
   const {sceneW,sceneH,cLat,cLon,mPerLon}=geoCtx;
-  const towers=prepared.filter(p=>!p.isSyn&&(p.finalH||p.typologyH)>=18)
+  // prefer proper towers; relax to mid-rises when the zone has few
+  let towers=prepared.filter(p=>!p.isSyn&&(p.finalH||p.typologyH)>=18)
     .sort((a,b)=>(b.finalH||b.typologyH)-(a.finalH||a.typologyH)).slice(0,30);
+  if(towers.length<6)
+    towers=prepared.filter(p=>!p.isSyn&&(p.finalH||p.typologyH)>=12)
+      .sort((a,b)=>(b.finalH||b.typologyH)-(a.finalH||a.typologyH)).slice(0,30);
   if(towers.length<6){
+    window.__atlasLeanStats={towers:towers.length,adopted:false,skipped:'too few tall buildings'};
     log('Ortho-lean: too few tall buildings here to estimate roof displacement - sampling roofs at the footprint','ai');
     return;
   }
@@ -1837,13 +1873,17 @@ function detectRoofInfill(prepared,roadSamples){
     rejects:null,sampleAreas:[]};   // filled below
   const neigh=prepared.filter(p=>!p.isSyn).map(p=>({
     x:(p.sLon-cLon)*mPerLon, z:(cLat-p.sLat)*M_LAT, h:p.finalH||p.typologyH}));
-  const out=[], rej={trace:0,complex:0,area:0};
+  const out=[], rej={trace:0,complex:0,area:0,shape:0};
   comps.sort((a,b)=>b.length-a.length).slice(0,350).forEach((cells,ci)=>{
     const ringG=traceOutline(cells,W);
     if(!ringG||ringG.length<4){ rej.trace++; return; }
     const ring=simplifyRing(ringG,1.25).map(([gx,gy])=>
       [gx/W*sceneW-sceneW/2, gy/H*sceneH-sceneH/2]);
     if(ring.length<3||ring.length>40){ rej.complex++; return; }
+    // user rule: only outlines that RESEMBLE building roofs extrude -
+    // compactness gate rejects ragged soil/clearing patches that pass
+    // the colour test (rectangle 1.0, L-shape ~0.71, ragged blobs lower)
+    if(ringSolidity(ring)<0.7){ rej.shape++; return; }
     const pts=ring.map(([x,z])=>new THREE.Vector2(x,z));
     pts.push(pts[0].clone());
     let area=0;
@@ -1933,6 +1973,10 @@ function buildBuildings(osm){
     });
     if(pts.length<3) return;
     sLat/=n; sLon/=n;
+
+    // user rule: nothing generated outside the selected area - buildings
+    // whose centre falls beyond the golden frame are skipped entirely
+    if(sLat<geoCtx.S||sLat>geoCtx.N||sLon<geoCtx.W||sLon>geoCtx.E) return;
 
     // shoelace area
     let area=0;
@@ -2102,6 +2146,10 @@ function buildBuildings(osm){
   $('stSynth').textContent=synCount.toLocaleString();
   $('stTallest').textContent=Math.round(tallest)+' m';
   $('stCoverage').textContent=real?Math.round(tagged/real*100)+'%':'0%';
+  // synthetic infill stays HIDDEN until the user clicks it on (user rule:
+  // the default view shows only real mapped footprints)
+  synGroup.visible=false;
+  $('synBtn').textContent='Synthetic infill: OFF';
   $('synBtn').style.display=synCount?'block':'none';
   log(`Extruded ${real} real footprints (${tagged} OSM z-tagged`+(refined?`, ${refined} shadow-estimated`:'')+`)`,'ok');
   if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (borders traced from satellite roof detection)`,'ai');
@@ -2117,6 +2165,33 @@ const ROAD_CLASS={
 const DRIVABLE=new Set(['motorway','trunk','primary','secondary','tertiary','residential','unclassified','living_street','service']);
 // walkable = every mapped way except pedestrian-banned expressways
 const WALKABLE=new Set(Object.keys(ROAD_CLASS).filter(k=>k!=='motorway'&&k!=='trunk'));
+// Pure (unit-tested): clip a road polyline to the scene rectangle
+// (Liang-Barsky per segment, contiguous pieces stitched). OSM ways run
+// past the capture box; the user rule is that nothing renders outside
+// the selected area, so ways are cut AT the boundary - a way that
+// leaves and re-enters yields several pieces.
+function clipPolyToRect(pts,halfW,halfH){
+  const clipSeg=(a,b)=>{
+    let t0=0,t1=1; const dx=b.x-a.x, dz=b.z-a.z;
+    const p=[-dx,dx,-dz,dz], q=[a.x+halfW,halfW-a.x,a.z+halfH,halfH-a.z];
+    for(let i=0;i<4;i++){
+      if(p[i]===0){ if(q[i]<0) return null; }
+      else{ const r=q[i]/p[i];
+        if(p[i]<0){ if(r>t1) return null; if(r>t0) t0=r; }
+        else{ if(r<t0) return null; if(r<t1) t1=r; } }
+    }
+    return [{x:a.x+dx*t0,z:a.z+dz*t0},{x:a.x+dx*t1,z:a.z+dz*t1}];
+  };
+  const out=[]; let run=null;
+  for(let i=0;i<pts.length-1;i++){
+    const c=clipSeg(pts[i],pts[i+1]);
+    if(!c){ run=null; continue; }
+    if(run&&Math.hypot(c[0].x-run[run.length-1].x,c[0].z-run[run.length-1].z)<1e-6)
+      run.push(c[1]);
+    else{ run=[c[0],c[1]]; out.push(run); }
+  }
+  return out;
+}
 function ribbonGeometry(points,width,y){
   const hw=width/2, P=[], I=[];
   const dirs=[];
@@ -2143,30 +2218,38 @@ function buildRoads(osm){
   const namedRoads=[];
   const {cLat,cLon,mPerLon}=geoCtx;
   let totalKm=0;
+  const halfW=geoCtx.sceneW/2, halfH=geoCtx.sceneH/2;
   osm.elements.forEach(el=>{
     if(el.type!=='way'||!el.tags||!el.tags.highway) return;
     const cls=ROAD_CLASS[el.tags.highway]; if(!cls) return;
-    const pts=[];
+    const raw=[];
     el.nodes.forEach(nid=>{ const nd=osm.nodesById[nid]; if(nd)
-      pts.push({x:(nd.lon-cLon)*mPerLon, z:(cLat-nd.lat)*M_LAT}); });
-    if(pts.length<2) return;
-    let len=0; for(let i=0;i<pts.length-1;i++) len+=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z);
-    totalKm+=len/1000;
-    const major=cls[1]===1;
-    if(major) pollutionCtx.majorKm+=len/1000; else pollutionCtx.minorKm+=len/1000;
-    const mesh=new THREE.Mesh(ribbonGeometry(pts,cls[0],major?0.22:0.16),
-      major?matRoadMajor:matRoadMinor);
-    mesh.receiveShadow=true;
-    roadGroup.add(mesh);
-    // cumulative distances (traffic animation + walkshed graph)
-    const cum=[0]; for(let i=0;i<pts.length-1;i++)
-      cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
-    if(DRIVABLE.has(el.tags.highway)&&len>40)
-      trafficPaths.push({pts,cum,total:len,major,hw:cls[0]/2});   // buses stick to major roads
-    if(WALKABLE.has(el.tags.highway)&&len>10)
-      walkPaths.push({pts,cum,total:len});   // incl. footways/pedestrian ways
-    if(el.tags.name&&len>60&&(major||len>120))
-      namedRoads.push({name:el.tags.name,pts,len,major});
+      raw.push({x:(nd.lon-cLon)*mPerLon, z:(cLat-nd.lat)*M_LAT}); });
+    if(raw.length<2) return;
+    // user rule: nothing outside the selected area - ways are clipped AT
+    // the golden-frame boundary (each in-area piece handled separately)
+    clipPolyToRect(raw,halfW,halfH).forEach(pts=>{
+      if(pts.length<2) return;
+      let len=0; for(let i=0;i<pts.length-1;i++)
+        len+=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z);
+      if(len<4) return;
+      totalKm+=len/1000;
+      const major=cls[1]===1;
+      if(major) pollutionCtx.majorKm+=len/1000; else pollutionCtx.minorKm+=len/1000;
+      const mesh=new THREE.Mesh(ribbonGeometry(pts,cls[0],major?0.22:0.16),
+        major?matRoadMajor:matRoadMinor);
+      mesh.receiveShadow=true;
+      roadGroup.add(mesh);
+      // cumulative distances (traffic animation + walkshed graph)
+      const cum=[0]; for(let i=0;i<pts.length-1;i++)
+        cum.push(cum[i]+Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z));
+      if(DRIVABLE.has(el.tags.highway)&&len>40)
+        trafficPaths.push({pts,cum,total:len,major,hw:cls[0]/2});   // buses stick to major roads
+      if(WALKABLE.has(el.tags.highway)&&len>10)
+        walkPaths.push({pts,cum,total:len});   // incl. footways/pedestrian ways
+      if(el.tags.name&&len>60&&(major||len>120))
+        namedRoads.push({name:el.tags.name,pts,len,major});
+    });
   });
   $('stRoads').textContent=totalKm.toFixed(1)+' km';
   log(`Road network: ${totalKm.toFixed(1)} km, ${trafficPaths.length} drivable segments`,'ok');
@@ -3579,6 +3662,30 @@ window.__atlasCard=async(name,title,lines)=>{
       {method:'POST',body:url});
     return 'saved '+name;
   }catch(e){ return 'collector offline'; }
+};
+// synthetic-infill state (user rule: hidden until clicked)
+window.__atlasSynState=()=>({visible:synGroup.visible,
+  count:synGroup.children.length,btn:$('synBtn').textContent});
+// selected-area confinement: max overhang of any building vertex / road
+// point beyond the golden frame, in metres (0 = fully confined)
+window.__atlasBoundsCheck=()=>{
+  if(!geoCtx) return null;
+  const hw=geoCtx.sceneW/2, hh=geoCtx.sceneH/2;
+  let bldOver=0, bldOut=0;
+  cityGroup.children.concat(synGroup.children).forEach(m=>{
+    if(!m.userData||!m.userData.ring) return;
+    let over=0;
+    m.userData.ring.forEach(([x,z])=>{
+      over=Math.max(over,Math.abs(x)-hw,Math.abs(z)-hh);
+    });
+    if(over>0){ bldOver=Math.max(bldOver,over); if(over>1) bldOut++; }
+  });
+  let roadOver=0;
+  trafficPaths.concat(walkPaths).forEach(p=>p.pts.forEach(pt=>{
+    roadOver=Math.max(roadOver,Math.abs(pt.x)-hw,Math.abs(pt.z)-hh);
+  }));
+  return {bldMaxOverhangM:+bldOver.toFixed(1),bldBeyond1m:bldOut,
+    roadMaxOverhangM:+Math.max(0,roadOver).toFixed(2)};
 };
 // geo-registration audit: for a 9x9 lat/lon grid over the current zone,
 // compare the canvas pixel every consumer's linear mapping produces
@@ -5447,8 +5554,8 @@ $('resetBtn').addEventListener('click',()=>{
   $('zoomCtl').style.display='none';
   setRouteMode(false); hideBldCard(); clearAnalysis(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
-  clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=true;
-  $('synBtn').textContent='Synthetic infill: ON';
+  clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=false;
+  $('synBtn').textContent='Synthetic infill: OFF';
   plannerClear();
   removeTraffic();
   $('fleetLegend').innerHTML=''; $('fleetTotal').textContent='0';
