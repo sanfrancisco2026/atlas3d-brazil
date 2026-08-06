@@ -2,6 +2,7 @@
 // verbatim from index.html.
 // Run: node test/facade_floors.test.js   (exit 0 = pass)
 const FLOOR_FT_M=3.048;
+function floorsFromCount(n){ return Math.max(1,Math.min(n||0,40)); }
 function countWindowRows(profile,minAmp){
   if(!profile||profile.length<8) return 0;
   const w=Math.max(3,Math.round(profile.length/10));
@@ -59,6 +60,15 @@ check('null-safe', countWindowRows(null)===0);
 console.log('=== floors -> height (10 ft per floor) ===');
 check('12 floors = 36.58m', Math.abs(12*FLOOR_FT_M-36.576)<1e-9);
 check('3 floors = 9.14m', Math.abs(3*FLOOR_FT_M-9.144)<1e-9);
+
+console.log('=== user rule: not visible -> exactly one floor ===');
+check('zero visible rows -> 1 floor', floorsFromCount(0)===1);
+check('undefined/null count -> 1 floor',
+  floorsFromCount(undefined)===1&&floorsFromCount(null)===1);
+check('1-2 visible floors honoured as counted',
+  floorsFromCount(1)===1&&floorsFromCount(2)===2);
+check('normal counts pass through', floorsFromCount(15)===15);
+check('runaway count capped at 40', floorsFromCount(90)===40);
 
 console.log(fail===0?'ALL PASS ('+pass+' checks)':'FAIL ('+fail+')');
 process.exit(fail===0?0:1);

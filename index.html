@@ -1802,6 +1802,10 @@ function estimateRoofLean(prepared){
    scale calibration (only its DIRECTION is needed). Used for buildings
    with no measured height (no OSM z, no LiDAR, no shadow control). */
 const FLOOR_FT_M=3.048;                       // 10 ft per floor
+// Pure (unit-tested): floors to build from a window-row count - what is
+// visible is what is built; NO visible floors means ONE floor (user
+// rule), and a runaway count is capped at 40.
+function floorsFromCount(n){ return Math.max(1,Math.min(n||0,40)); }
 // Pure (unit-tested): count confident window-row periods in a luminance
 // profile - detrend with a wide moving average, require real banding
 // amplitude, then count full light->dark alternations.
@@ -1839,7 +1843,7 @@ function estimateFacadeHeights(prepared){
   };
   const step=L*FLOOR_FT_M/6;                  // ~6 samples per expected floor
   const maxLen=L*FLOOR_FT_M*42;               // up to 42 floors of facade
-  let applied=0;
+  let applied=0, single=0;
   prepared.forEach(p=>{
     if(p.isSyn||p.tagged||p.shadow) return;   // only unmeasured buildings
     // base of the visible facade: footprint vertex farthest along +lean
@@ -1853,18 +1857,17 @@ function estimateFacadeHeights(prepared){
       prof.push(Lv);
     }
     const n=countWindowRows(prof,4);
-    if(n>=3&&n<=40){
-      const h=n*FLOOR_FT_M;
-      if(h>p.typologyH*0.5&&h<p.typologyH*4+20){   // reject wild outliers
-        p.finalH=h; p.facade=true; applied++;
-      }
-    }
+    // user rule: build exactly what is observed - counted rows are the
+    // floor count; NO visible floors means a single 10 ft floor
+    const floors=floorsFromCount(n);
+    p.finalH=floors*FLOOR_FT_M; p.facade=true;
+    if(n===0) single++; else applied++;
   });
-  if(applied)
-    log(`Facade floor-count: ${applied} heights estimated by counting window `+
-      `rows in the oblique imagery (10 ft/floor, along the ${Math.round(
-      ((Math.atan2(ux,-uz)*180/Math.PI)+360)%360)}deg lean)`,'ai');
-  return applied;
+  if(applied+single)
+    log(`Facade floor-count: ${applied} heights from counted window rows + `+
+      `${single} single-floor (no visible floors) - 10 ft/floor along the `+
+      `${Math.round(((Math.atan2(ux,-uz)*180/Math.PI)+360)%360)}deg lean`,'ai');
+  return applied+single;
 }
 
 // Segment unmapped roofs from the RAW satellite pixels and return
