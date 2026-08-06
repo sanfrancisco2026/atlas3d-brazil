@@ -303,8 +303,8 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <input id="mapToken" type="password" placeholder="MLY|... (leave empty to skip)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
 
-    <label class="small">OpenAQ key (optional &mdash; live air quality)</label>
-    <input id="aqKey" type="password" placeholder="explore.openaq.org key (empty = estimate from OSM)"
+    <label class="small">OpenWeather API key (optional &mdash; live weather + air quality)</label>
+    <input id="aqKey" type="password" placeholder="openweathermap.org key (empty = Open-Meteo + estimate)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
 
     <label class="small">Time machine &mdash; historic satellite (NASA MODIS, 2000&rarr;)</label>
@@ -381,7 +381,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button class="ghost td" data-h="21.5">Night</button>
     </div>
 
-    <div class="slider-row" style="margin-top:14px"><span>Weather (Open-Meteo)</span><b id="wxVal">&mdash;</b></div>
+    <div class="slider-row" style="margin-top:14px"><span>Weather</span><b id="wxVal">&mdash;</b></div>
     <select id="wxMonth">
       <option value="live" selected>Live &mdash; right now</option>
       <option value="1">January pattern</option><option value="2">February pattern</option>
@@ -504,7 +504,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Solar roof (est.)</span><b id="bcSolar">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
-<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather: Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE &middot; Crime sample: crimebrasil.com.br</div>
+<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather &amp; air quality: OpenWeather (with key) / Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE &middot; Crime sample: crimebrasil.com.br</div>
 
 <!-- ================= LOADER ================= -->
 <div id="loader">
@@ -3388,13 +3388,66 @@ function linearTrend(pairs){
 }
 // Pure (unit-tested): daily-precip mm -> rain visual intensity 0..1
 function rainIntensity(precipMm){ return clamp(precipMm/12,0,1); }
+// Pure (unit-tested): OpenWeather condition id -> the WMO code the rest
+// of the app already speaks (2xx storm, 3xx drizzle, 5xx rain, 6xx snow,
+// 7xx haze/fog, 800 clear, 80x cloud bands).
+function owmToWmo(id){
+  if(id==null) return null;
+  if(id>=200&&id<300) return 95;
+  if(id>=300&&id<400) return 53;
+  if(id>=500&&id<600) return id>=520?80:(id>=502?65:(id===501?63:61));
+  if(id>=600&&id<700) return 71;
+  if(id>=700&&id<800) return 45;
+  if(id===800) return 0;
+  if(id===801) return 1;
+  if(id===802) return 2;
+  if(id>802) return 3;
+  return null;
+}
+// Pure (unit-tested): OpenWeather current-weather payload -> the app's
+// weather record. units=metric gives C and m/s, so wind is converted to
+// km/h; precipitation prefers the 1h bucket, then snow, then 0.
+function parseOWMWeather(j){
+  const w=(j.weather&&j.weather[0])||{};
+  const rain=(j.rain&&(j.rain['1h']!=null?j.rain['1h']:j.rain['3h']/3))||0;
+  const snow=(j.snow&&(j.snow['1h']!=null?j.snow['1h']:j.snow['3h']/3))||0;
+  return {tempC:j.main&&j.main.temp, precip:Math.max(rain,snow),
+    windKmh:(j.wind&&j.wind.speed||0)*3.6, windDeg:(j.wind&&j.wind.deg)||0,
+    cloud:(j.clouds&&j.clouds.all)||0, code:owmToWmo(w.id),
+    label:'OpenWeather'+(w.description?' · '+w.description:'')};
+}
+// Pure (unit-tested): OpenWeather air-pollution payload -> PM2.5 (and the
+// 1..5 AQI band it reports alongside).
+function parseOWMAir(j){
+  const e=j&&j.list&&j.list[0];
+  if(!e||!e.components) return null;
+  const pm=e.components.pm2_5;
+  if(!(pm>=0)) return null;
+  const aqi=e.main&&e.main.aqi;
+  const OWM_AQI=['','Good','Fair','Moderate','Poor','Very poor'];
+  return {pm25:Math.round(pm*10)/10, aqi,
+    label:'OpenWeather'+(aqi?' · AQI '+aqi+' ('+OWM_AQI[aqi]+')':''),
+    components:e.components};
+}
 async function fetchLiveWeather(lat,lon){
+  const key=$('aqKey').value.trim();
+  if(key){                                   // OpenWeather when keyed
+    try{
+      const r=await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}`+
+        `&lon=${lon}&units=metric&appid=${encodeURIComponent(key)}`);
+      if(!r.ok) throw new Error('HTTP '+r.status+(r.status===401?' (key rejected)':''));
+      return parseOWMWeather(await r.json());
+    }catch(err){
+      log('OpenWeather: '+err.message+' - using keyless Open-Meteo','err');
+    }
+  }
   const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`+
     `&current=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,cloud_cover,weather_code`);
   if(!r.ok) throw new Error('HTTP '+r.status);
   const c=(await r.json()).current;
   return {tempC:c.temperature_2m, precip:c.precipitation, windKmh:c.wind_speed_10m,
-    windDeg:c.wind_direction_10m, cloud:c.cloud_cover, code:c.weather_code};
+    windDeg:c.wind_direction_10m, cloud:c.cloud_cover, code:c.weather_code,
+    label:'Open-Meteo'};
 }
 async function fetchClimatology(lat,lon){
   if(climCache) return climCache;
@@ -3463,7 +3516,8 @@ async function applyWeatherMode(){
   try{
     if(mode==='live'){
       const w=await fetchLiveWeather(geoCtx.cLat,geoCtx.cLon);
-      applyWeather(w,'live now');
+      // name the provider that actually answered (OpenWeather when keyed)
+      applyWeather(w,'live now'+(w.label?' · '+w.label.split(' · ')[0]:''));
       return;
     }
     const month=+mode;
@@ -3513,9 +3567,10 @@ $('wxMonth').addEventListener('change',applyWeatherMode);
 $('simSlider').addEventListener('input',updateSimYear);
 
 /* ============================================================
-   AIR QUALITY & POLLUTION (OpenAQ + OSM-derived fallback)
-   With a user key, live PM2.5 comes from OpenAQ stations near the
-   capture zone. Without one (or on any failure) we estimate it from
+   AIR QUALITY & POLLUTION (OpenWeather + OSM-derived fallback)
+   With a user key, live PM2.5 comes from the OpenWeather Air Pollution
+   API for the capture zone (the same key also serves current weather).
+   Without one (or on any failure) we estimate it from
    what the scene itself tells us: major/minor road density (vehicle
    exhaust) and industrial footprint fraction (stationary sources).
    The index then drives visible effects: smog-tinted fog, exhaust
@@ -3540,26 +3595,19 @@ function aqBand(pm){
 async function fetchAirQuality(b){
   const key=$('aqKey').value.trim(); if(!key) return null;
   try{
-    const H={headers:{'X-API-Key':key}};
-    const r=await fetch(`https://api.openaq.org/v3/locations?coordinates=${b.cLat},${b.cLon}&radius=15000&limit=20`,H);
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const locs=(await r.json()).results||[];
-    const sensorParam={};                      // sensorsId -> parameter name
-    locs.forEach(l=>(l.sensors||[]).forEach(s=>{
-      sensorParam[s.id]=s.parameter&&s.parameter.name; }));
-    const vals=[];
-    for(const l of locs.slice(0,5)){
-      const lr=await fetch(`https://api.openaq.org/v3/locations/${l.id}/latest`,H);
-      if(!lr.ok) continue;
-      ((await lr.json()).results||[]).forEach(m=>{
-        const p=sensorParam[m.sensorsId];
-        if(p==='pm25'&&m.value>0) vals.push(m.value);
-        else if(p==='pm10'&&m.value>0) vals.push(m.value*0.5); // rough pm10->pm25
-      });
-    }
-    if(!vals.length) return null;
-    return {pm25:Math.round(_median(vals)*10)/10, label:'OpenAQ · '+vals.length+' readings'};
-  }catch(err){ log('OpenAQ: '+err.message+' - falling back to OSM estimate','err'); return null; }
+    const r=await fetch(`https://api.openweathermap.org/data/2.5/air_pollution?`+
+      `lat=${b.cLat}&lon=${b.cLon}&appid=${encodeURIComponent(key)}`);
+    if(!r.ok) throw new Error('HTTP '+r.status+(r.status===401?' (key rejected)':''));
+    const air=parseOWMAir(await r.json());
+    if(!air) return null;
+    const c=air.components;
+    log(`OpenWeather air quality: PM2.5 ${air.pm25}, PM10 ${c.pm10}, `+
+      `NO2 ${c.no2}, O3 ${c.o3} ug/m3`,'ai');
+    return air;
+  }catch(err){
+    log('OpenWeather air quality: '+err.message+' - falling back to OSM estimate','err');
+    return null;
+  }
 }
 function makePuffTexture(){
   const c=document.createElement('canvas'); c.width=c.height=64;

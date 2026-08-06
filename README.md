@@ -33,7 +33,9 @@ the module script.)
 - **Living streets** — mixed GLB vehicle fleet (cars/motos/vans/buses/semis)
   driving a real road-network graph with junction continuity, lane discipline
   clamped to carriageway width, and edge-portal entry/exit.
-- **Time, weather, night** — full day/night cycle, Open-Meteo live weather +
+- **Time, weather, night** — full day/night cycle, live weather and air
+  quality from **OpenWeather** with your own key (keyless Open-Meteo +
+  OSM-derived AQ estimate otherwise) +
   monthly climatology, climate-trend simulation slider, RainViewer radar,
   NASA GIBS historic imagery, VIIRS-calibrated night lights.
 - **Official geodata** — IBGE municipal mesh (outline-only boundary layer
@@ -102,7 +104,8 @@ for f in test/*.test.js; do node "$f"; done
 | IBGE (servicodados / malhas / BDIA) | municipality data, boundaries, geoscience |
 | Microsoft Building Footprints (ODbL) | gap-fill building polygons |
 | PMSP LiDAR 2017 (AWS Open Data) | São Paulo measured heights |
-| Open-Meteo, RainViewer, NASA GIBS | weather, radar, historic/night imagery |
+| OpenWeather (your key) | live weather + air quality (PM2.5, AQI) |
+| Open-Meteo, RainViewer, NASA GIBS | keyless weather + climate archive, radar, historic/night imagery |
 | OSRM, Nominatim | routing, geocoding |
 | Mapillary (optional token) | street-photo facades + reference tints |
 | crimebrasil.com.br (sample) | crime layer |

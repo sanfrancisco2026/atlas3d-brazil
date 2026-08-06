@@ -96,8 +96,9 @@ two offline data files. There is no server, no package.json, no bundler — open
    Overpass query since the Geofabrik extracts lack the name field.
 10c. 3D navigation: +/- zoom buttons and keys (`dollyZoom`), WASD/arrow
    flight with R/F altitude (`updateNav`), double-click fly-to on the ground.
-11. Air quality: `applyAirQuality` uses OpenAQ v3 (optional user key input
-   `#aqKey`) or falls back to `estimatePM25` (pure, tested) derived from road
+11. Air quality: `applyAirQuality` uses the OpenWeather Air Pollution API
+   (optional user key input `#aqKey`, the same key that serves live
+   weather) or falls back to `estimatePM25` (pure, tested) derived from road
    density + industrial footprint collected during build. PM2.5 drives smog
    fog tint/density, exhaust haze over major roads, and animated smoke plumes
    from industrial buildings (`buildPollutionFX`/`updatePollution`). The HUD
@@ -227,10 +228,14 @@ No required API keys. All backing services are free/public:
 - **Mapillary access token** — optional, user-supplied at runtime via the
   "Mapillary token" password input in the UI (for real street-photo facades).
   Never hardcode a token in source; it's a per-session runtime input only.
-- **OpenAQ API key** — optional, user-supplied at runtime via the "OpenAQ key"
-  password input (live PM2.5 from explore.openaq.org). Same rule: never
-  hardcode; without it the app estimates air quality from OSM-derived road
-  density + industrial footprint.
+- **OpenWeather API key** — optional, user-supplied at runtime via the
+  "OpenWeather API key" password input. One key serves BOTH live current
+  weather (`/data/2.5/weather`) and live air quality (`/data/2.5/air_pollution`,
+  PM2.5 + PM10/NO2/O3/SO2/CO and the 1–5 AQI band). Same rule: never
+  hardcode. Without it the app uses keyless Open-Meteo for weather and
+  estimates air quality from OSM-derived road density + industrial
+  footprint; a rejected key logs the reason and degrades to the same
+  keyless path rather than failing the build.
 
 ## Standing rules (for the /loop working on this repo)
 
