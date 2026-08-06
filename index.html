@@ -432,6 +432,18 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="cadBtn" class="ghost">Cadastral: OFF</button>
     </div>
 
+    <div class="slider-row" style="margin-top:12px"><span>Municipal layer (geo360 / GeoJSON)</span><b></b></div>
+    <input type="file" id="extFile" accept=".json,.geojson" style="font-size:.62rem;color:#93a3bc;width:100%">
+    <input type="text" id="extUrl" placeholder="…or a GeoJSON URL (CORS-enabled)" style="margin-top:6px">
+    <input type="password" id="extToken" placeholder="Optional bearer token (your own portal login)" style="margin-top:6px">
+    <div class="btn-row">
+      <button id="extBtn" class="ghost">&#128506; Add layer</button>
+      <button id="extClearBtn" class="ghost">Clear layers</button>
+    </div>
+    <p class="hint">Load an <b>iCad / geo360 export</b> (or any GeoJSON) as a 3D layer, geo-registered
+      onto the satellite base. Lat/long and <b>UTM-22S (SIRGAS 2000)</b> coordinates are both
+      detected and placed automatically.</p>
+
     <div class="slider-row" style="margin-top:12px"><span>GIS analysis</span><b></b></div>
     <div class="btn-row">
       <button id="measureBtn" class="ghost">&#128207; Measure</button>
@@ -3946,6 +3958,171 @@ $('timeSlider').addEventListener('change',()=>{ if(appState==='city') refreshEnv
 $('fogSlider').addEventListener('input',applyAtmosphere);
 
 /* ============================================================
+   EXTERNAL MUNICIPAL LAYERS (geo360 / iCad exports, any GeoJSON)
+   The Goiania iCad portal serves its layers only to an authenticated
+   session (its API answers 401 "Sessao expirada" even from its own
+   page), so ATLAS-3D never scrapes it. Instead the user brings the
+   data they already have access to - a portal export, an authenticated
+   endpoint plus their own token, or any public GeoJSON - and the app
+   places it correctly on the 3D satellite base. The portal works in
+   UTM-22S (SIRGAS 2000), so projected coordinates are converted to
+   WGS84 automatically before being geo-registered.
+============================================================ */
+let extLayerGroup=null, extLayerCount=0;
+const EXT_COLORS=[0xffd24d,0x4dff9d,0xff7ad9,0x7ab8ff,0xffa04d];
+// Pure (unit-tested): inverse UTM (transverse Mercator) -> WGS84.
+// SIRGAS 2000 shares GRS80 with WGS84 (<1m difference), so the same
+// ellipsoid constants serve both.
+function utmToLatLon(E,N,zone,south){
+  const a=6378137, f=1/298.257223563, k0=0.9996;
+  const e2=f*(2-f), ep2=e2/(1-e2);
+  const x=E-500000, y=south?N-10000000:N;
+  const M=y/k0, mu=M/(a*(1-e2/4-3*e2*e2/64-5*e2*e2*e2/256));
+  const e1=(1-Math.sqrt(1-e2))/(1+Math.sqrt(1-e2));
+  const phi1=mu+(3*e1/2-27*e1*e1*e1/32)*Math.sin(2*mu)
+    +(21*e1*e1/16-55*e1*e1*e1*e1/32)*Math.sin(4*mu)
+    +(151*e1*e1*e1/96)*Math.sin(6*mu)+(1097*e1*e1*e1*e1/512)*Math.sin(8*mu);
+  const sp=Math.sin(phi1), cp=Math.cos(phi1), tp=Math.tan(phi1);
+  const N1=a/Math.sqrt(1-e2*sp*sp);
+  const T1=tp*tp, C1=ep2*cp*cp;
+  const R1=a*(1-e2)/Math.pow(1-e2*sp*sp,1.5);
+  const D=x/(N1*k0);
+  const lat=phi1-(N1*tp/R1)*(D*D/2-(5+3*T1+10*C1-4*C1*C1-9*ep2)*D*D*D*D/24
+    +(61+90*T1+298*C1+45*T1*T1-252*ep2-3*C1*C1)*D*D*D*D*D*D/720);
+  const lon=(D-(1+2*T1+C1)*D*D*D/6
+    +(5-2*C1+28*T1-3*C1*C1+8*ep2+24*T1*T1)*D*D*D*D*D/120)/cp;
+  return {lat:lat*180/Math.PI, lon:(zone*6-183)+lon*180/Math.PI};
+}
+// Pure (unit-tested): decide how a GeoJSON's coordinates are expressed.
+// Values inside lat/lon range are geographic; big metric values are
+// projected (UTM), with the zone taken from an EPSG hint when present.
+function detectCRS(sample,crsName){
+  const m=/EPSG(?:::|:)?(\d{4,6})/i.exec(crsName||'');
+  const code=m?+m[1]:0;
+  if(code===4326||code===4674) return {kind:'geographic'};
+  if(code>=32701&&code<=32760) return {kind:'utm',zone:code-32700,south:true};
+  if(code>=32601&&code<=32660) return {kind:'utm',zone:code-32600,south:false};
+  if(code>=31972&&code<=31985) return {kind:'utm',zone:code-31960,south:true}; // SIRGAS 2000
+  if(Math.abs(sample[0])<=180&&Math.abs(sample[1])<=90) return {kind:'geographic'};
+  return {kind:'utm',zone:22,south:true};    // Goiania default (portal UTM-22S)
+}
+// Pure (unit-tested): every line/ring in a GeoJSON as arrays of [x,y]
+function geoJsonRings(gj){
+  const out=[];
+  const walk=g=>{
+    if(!g) return;
+    if(g.type==='FeatureCollection') return (g.features||[]).forEach(f=>walk(f.geometry));
+    if(g.type==='Feature') return walk(g.geometry);
+    if(g.type==='GeometryCollection') return (g.geometries||[]).forEach(walk);
+    const c=g.coordinates;
+    if(!c) return;
+    if(g.type==='LineString') out.push(c);
+    else if(g.type==='MultiLineString'||g.type==='Polygon') c.forEach(r=>out.push(r));
+    else if(g.type==='MultiPolygon') c.forEach(p=>p.forEach(r=>out.push(r)));
+  };
+  walk(gj);
+  return out.filter(r=>Array.isArray(r)&&r.length>1);
+}
+function clearExtLayers(){
+  if(extLayerGroup){ scene.remove(extLayerGroup);
+    extLayerGroup.traverse(o=>{ if(o.geometry)o.geometry.dispose(); });
+    extLayerGroup=null; }
+  extLayerCount=0;
+  $('extBtn').innerHTML='&#128506; Add layer';
+}
+// Place a parsed GeoJSON onto the 3D scene, clipped to the selected area
+function addExternalLayer(gj,label){
+  if(appState!=='city'||!geoCtx){ log('Load a city first, then add the layer','err'); return; }
+  const rings=geoJsonRings(gj);
+  if(!rings.length){ log('Layer "'+label+'": no line or polygon geometry found','err'); return; }
+  const crs=detectCRS(rings[0][0],
+    (gj.crs&&gj.crs.properties&&gj.crs.properties.name)||gj.name||'');
+  const {cLat,cLon,mPerLon,sceneW,sceneH}=geoCtx;
+  const toScene=([X,Y])=>{
+    const ll=crs.kind==='utm'?utmToLatLon(X,Y,crs.zone,crs.south):{lon:X,lat:Y};
+    return {x:(ll.lon-cLon)*mPerLon, z:(cLat-ll.lat)*M_LAT};
+  };
+  const pos=[]; let kept=0;
+  rings.forEach(r=>{
+    const pts=r.map(toScene);
+    clipPolyToRect(pts,sceneW/2,sceneH/2).forEach(piece=>{
+      for(let i=0;i<piece.length-1;i++){
+        pos.push(piece[i].x,0.65,piece[i].z, piece[i+1].x,0.65,piece[i+1].z);
+      }
+      kept++;
+    });
+  });
+  if(!pos.length){
+    log(`Layer "${label}": ${rings.length} geometries read (${crs.kind}`+
+      `${crs.kind==='utm'?' zone '+crs.zone+(crs.south?'S':'N'):''}) but none fall inside `+
+      `the selected area`,'err');
+    return;
+  }
+  if(!extLayerGroup){ extLayerGroup=new THREE.Group(); scene.add(extLayerGroup); }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(pos),3));
+  extLayerGroup.add(new THREE.LineSegments(g,new THREE.LineBasicMaterial({
+    color:EXT_COLORS[extLayerCount%EXT_COLORS.length],transparent:true,opacity:.95})));
+  extLayerCount++;
+  $('extBtn').innerHTML='&#128506; Layers: '+extLayerCount;
+  log(`Layer "${label}": ${kept} geometries placed from ${rings.length} read `+
+    `(${crs.kind==='utm'?'UTM zone '+crs.zone+(crs.south?'S':'N')+' -> WGS84':'lat/long'}), `+
+    `clipped to the selected area`,'ok');
+}
+async function loadExternalLayer(){
+  const f=$('extFile').files&&$('extFile').files[0];
+  if(f){
+    try{
+      const gj=JSON.parse(await f.text());
+      addExternalLayer(gj,f.name);
+    }catch(e){ log('Layer file: '+e.message,'err'); }
+    return;
+  }
+  const url=$('extUrl').value.trim();
+  if(!url){ log('Choose a GeoJSON file or enter a URL first','err'); return; }
+  const tok=$('extToken').value.trim();
+  try{
+    const res=await fetch(url,tok?{headers:{Authorization:'Bearer '+tok}}:undefined);
+    if(!res.ok) throw new Error('HTTP '+res.status+
+      (res.status===401?' - this endpoint needs your portal login; paste your own token above':''));
+    addExternalLayer(await res.json(),url.split('/').pop().slice(0,40)||'remote layer');
+  }catch(e){ log('Layer URL: '+e.message,'err'); }
+}
+$('extBtn').addEventListener('click',loadExternalLayer);
+$('extClearBtn').addEventListener('click',()=>{ clearExtLayers(); log('External layers cleared','ai'); });
+window.__atlasAddLayer=(gj,label)=>addExternalLayer(gj,label||'test layer');
+window.__atlasExtStats=()=>({layers:extLayerCount,
+  segments:extLayerGroup?extLayerGroup.children.reduce(
+    (a,c)=>a+c.geometry.attributes.position.count/2,0):0});
+// verification: max ground deviation between the newest external layer
+// and the built-in cadastral layer (same source, two coordinate paths)
+window.__atlasExtVsCad=()=>{
+  if(!extLayerGroup||!extLayerGroup.children.length||!cadGroup||!cadGroup.children.length)
+    return {error:'need both an external layer and the cadastral layer on'};
+  const A=extLayerGroup.children[extLayerGroup.children.length-1]
+    .geometry.attributes.position;
+  const B=cadGroup.children[0].geometry.attributes.position;
+  // compare INTERIOR vertices only: the built-in cadastral layer keeps
+  // whole segments (endpoints may sit outside the frame) while the
+  // loader cuts them at the boundary, so border vertices legitimately
+  // differ - the projection itself is judged away from the edge.
+  const hw=geoCtx.sceneW/2-40, hh=geoCtx.sceneH/2-40;
+  let maxD=0, n=0;
+  for(let i=0;i<A.count;i++){
+    if(Math.abs(A.getX(i))>hw||Math.abs(A.getZ(i))>hh) continue;
+    let best=Infinity;
+    for(let j=0;j<B.count;j++){
+      const d=Math.hypot(A.getX(i)-B.getX(j),A.getZ(i)-B.getZ(j));
+      if(d<best) best=d;
+    }
+    if(best>maxD) maxD=best;
+    n++;
+  }
+  return {extVertices:A.count,cadVertices:B.count,interiorCompared:n,
+    maxDeviationM:+maxD.toFixed(4)};
+};
+
+/* ============================================================
    GIS ANALYSIS SUITE
    Competitive parity with commercial digital twins (ArcGIS Urban,
    Cesium, Shadowmap): in-scene measurement, sun-hours shadow
@@ -4400,7 +4577,7 @@ function runWalkshed(pt){
 }
 function clearAnalysis(){          // on rebuild / back-to-map
   measureMode=false; clearMeasure(); clearSunAnalysis(); clearFloodSim();
-  clearWalkshed();
+  clearWalkshed(); clearExtLayers();
   $('floodRise').value=0;
 }
 window.__atlasWalkshedRun=(x,z)=>{ clearWalkshed(); runWalkshed({x,z}); };

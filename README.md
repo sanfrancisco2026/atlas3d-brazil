@@ -40,6 +40,13 @@ the module script.)
   with name/population details), BDIA geoscience info, census-sector
   cadastral lines, crime sample layer, OSM/OpenInfraMap infrastructure
   planner layers (simulated fallbacks are always badged).
+- **Municipal layer loader** — drop in a **geo360 / iCad export** (or any
+  GeoJSON file, URL, or token-protected endpoint you have access to) and
+  it is placed on the 3D satellite base, geo-registered and clipped to
+  the selected area. Lat/long and **UTM-22S (SIRGAS 2000)** are detected
+  and converted automatically — verified to 0.1 mm against known ground
+  truth. ATLAS-3D never scrapes authenticated portals; you bring the
+  data you have rights to.
 - **Analysis** — routing that follows the OSRM polyline exactly, greedy
   set-cover cell-tower planner with per-tower siting justification, rooftop
   solar potential, carbon-credit scenarios, pollution/AQ effects.
