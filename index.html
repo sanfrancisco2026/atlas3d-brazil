@@ -831,6 +831,97 @@ function lidarHeightAt(a,lat,lon,decode){
   }
   return m;
 }
+/* ---- real OSM heights for offline zones ----
+   The offline Geofabrik extracts store buildings as [type, ring] - the
+   shapefiles carry no height or building:levels attribute, so preset
+   zones had NO OSM z-data and every height fell through to estimation.
+   (Live-Overpass zones like Manhattan always had it: 86% z-tagged.)
+   These helpers fetch just the height tags for the bbox from Overpass
+   and attach them to the matching offline footprints, so extrusion uses
+   the real OSM z-index wherever the community has mapped it. */
+// Pure (unit-tested): Overpass "out tags center" elements -> height
+// samples. Accepts height in metres ("38", "38 m", "38.5"), feet
+// ("125'" / "125 ft"), or building:levels (x3.2m, +1m parapet).
+function parseOverpassHeights(json){
+  const out=[];
+  ((json&&json.elements)||[]).forEach(el=>{
+    const t=el.tags||{}, c=el.center||el;
+    if(c.lat==null||c.lon==null) return;
+    let h=null;
+    const raw=t.height||t['building:height'];
+    if(raw!=null){
+      const s=String(raw).trim();
+      const ft=/^([\d.]+)\s*(?:'|ft|feet)$/i.exec(s);
+      if(ft) h=parseFloat(ft[1])*0.3048;
+      else{ const m=parseFloat(s); if(isFinite(m)) h=m; }
+    }
+    if(h==null&&t['building:levels']!=null){
+      const lv=parseFloat(t['building:levels']);
+      if(isFinite(lv)&&lv>0) h=lv*3.2+1;
+    }
+    if(h!=null&&h>=2&&h<=650) out.push({lat:c.lat,lon:c.lon,h,
+      src:raw!=null?'height':'levels'});
+  });
+  return out;
+}
+// Pure (unit-tested): attach each height sample to the nearest building
+// centroid within tolM metres (one sample per building, closest wins).
+function matchHeightsToBuildings(builds,samples,tolM){
+  const M=111320, out=new Map(), best=new Map();
+  samples.forEach(s=>{
+    let bi=-1, bd=tolM;
+    builds.forEach((b,i)=>{
+      const dLat=(b.lat-s.lat)*M;
+      const dLon=(b.lon-s.lon)*M*Math.cos(s.lat*Math.PI/180);
+      const d=Math.hypot(dLat,dLon);
+      if(d<bd){ bd=d; bi=i; }
+    });
+    if(bi>=0&&(!best.has(bi)||bd<best.get(bi))){
+      best.set(bi,bd); out.set(builds[bi].id,s);
+    }
+  });
+  return out;
+}
+// Overpass mirrors: the main endpoint regularly answers 504 when busy,
+// which cost a zone all of its OSM heights, so try the mirrors in turn.
+const OVERPASS_MIRRORS=['https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter'];
+async function fetchOSMHeights(b){
+  const q=`[out:json][timeout:25];(`+
+    `way["building"]["height"](${b.S},${b.W},${b.N},${b.E});`+
+    `way["building"]["building:levels"](${b.S},${b.W},${b.N},${b.E});`+
+    `);out tags center;`;
+  let last='';
+  for(const url of OVERPASS_MIRRORS){
+    try{
+      const r=await fetch(url,{method:'POST',body:q});
+      if(!r.ok){ last='HTTP '+r.status; continue; }
+      return parseOverpassHeights(await r.json());
+    }catch(e){ last=e.message; }
+  }
+  throw new Error(last+' (all Overpass mirrors)');
+}
+// attach fetched heights to an already-parsed offline dataset
+function applyOSMHeights(data,samples){
+  const builds=[];
+  data.elements.forEach(el=>{
+    if(el.type!=='way'||!el.tags||!el.tags.building||el.tags.height) return;
+    let sLat=0,sLon=0,n=0;
+    el.nodes.forEach(id=>{ const nd=data.nodesById[id];
+      if(nd){ sLat+=nd.lat; sLon+=nd.lon; n++; } });
+    if(n) builds.push({id:el.id,lat:sLat/n,lon:sLon/n,el});
+  });
+  const matched=matchHeightsToBuildings(builds,samples,28);
+  let applied=0, lv=0;
+  builds.forEach(bd=>{
+    const s=matched.get(bd.id); if(!s) return;
+    bd.el.tags.height=String(Math.round(s.h*10)/10);
+    bd.el.tags['osm:height']='1';
+    applied++; if(s.src==='levels') lv++;
+  });
+  return {applied,fromLevels:lv,samples:samples.length};
+}
 function localOSM(b){
   if(!window.ATLAS_LOCAL||!window.ATLAS_LOCAL.areas) return null;
   const a=window.ATLAS_LOCAL.areas.find(a=>b.S>=a.S&&b.N<=a.N&&b.W>=a.W&&b.E<=a.E);
@@ -1842,8 +1933,14 @@ function countWindowRows(profile,minAmp){
 function estimateFacadeHeights(prepared){
   if(!satData||!geoCtx) return 0;
   const L=Math.hypot(satLean.x,satLean.z);
-  // needs a strong oblique view AND enough image resolution per floor
-  if(L<0.2){ if(L>0) log('Facade floor-count: lean too shallow here for window counting','ai'); return 0; }
+  // needs a strong oblique view AND enough image resolution per floor.
+  // The epsilon matters: the lean scan steps by 0.05/0.01, so a lean of
+  // exactly 0.20 arrives as 0.19999999999999998 and a bare "< 0.2"
+  // silently skipped window counting in every such zone.
+  if(L<0.2-1e-9){
+    if(L>0) log('Facade floor-count: lean too shallow here for window counting','ai');
+    return 0;
+  }
   const ux=satLean.x/L, uz=satLean.z/L;
   const {sceneW,sceneH}=geoCtx;
   const d=satData.imgData.data;
@@ -5814,10 +5911,22 @@ $('buildBtn').addEventListener('click',async()=>{
       log(`+ ${local.data.lidarCount} LiDAR-measured heights (PMSP 2017)`,'ai');
     geoCtx.placeName=(local&&local.name)||$('searchInput').value.trim()
       ||`${b.cLat.toFixed(4)}, ${b.cLon.toFixed(4)}`;
-    const [osm,sat]=await Promise.all([
+    // Offline zones carry no height tags (the shapefiles have none), so
+    // fetch just the OSM height/building:levels tags for this bbox in
+    // parallel with the imagery - no extra wall-clock, and the real
+    // z-index then drives extrusion exactly as it does for live zones.
+    const [osm,sat,heights]=await Promise.all([
       local?Promise.resolve(local.data):fetchOSM(b),
-      fetchSatellite(b)]);
+      fetchSatellite(b),
+      local?fetchOSMHeights(b).catch(e=>{
+        log('OSM heights: '+e.message+' - falling back to estimation','err');
+        return null; }):Promise.resolve(null)]);
     satData=sat;
+    if(local&&heights&&heights.length){
+      const r=applyOSMHeights(osm,heights);
+      log(`OSM z-index: ${r.applied} buildings tagged from ${r.samples} live `+
+        `Overpass height records`+(r.fromLevels?` (${r.fromLevels} via building:levels)`:''),'ok');
+    }
     step('s2','done'); step('s3','done'); step('s4','doing');
     const buildingCount=osm.elements.filter(e=>e.type==='way'&&e.tags&&e.tags.building).length;
     if(!buildingCount) log('Warning: zero tagged buildings here - view may be sparse','err');
