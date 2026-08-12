@@ -447,6 +447,20 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
       <button id="cadBtn" class="ghost">Cadastral: OFF</button>
     </div>
 
+    <div class="slider-row" style="margin-top:12px"><span>Open GIS layers (South Africa)</span><b></b></div>
+    <select id="saLayerSel">
+      <option value="">&mdash; choose an open layer &mdash;</option>
+      <option value="wards">MDB ward boundaries (2020)</option>
+      <option value="munis">MDB local municipal boundaries (2018)</option>
+      <option value="ctParks">Cape Town parks</option>
+      <option value="ctZoning">Cape Town zoning</option>
+      <option value="ctRail">Cape Town railway lines</option>
+      <option value="ctWater">Cape Town open watercourses</option>
+    </select>
+    <div class="btn-row"><button id="saLayerBtn" class="ghost">&#127758; Add SA layer</button></div>
+    <p class="hint">Official open data, fetched live for the selected area: Municipal
+      Demarcation Board (national) and City of Cape Town Open Data Portal.</p>
+
     <div class="slider-row" style="margin-top:12px"><span>Municipal layer (geo360 / GeoJSON)</span><b></b></div>
     <input type="file" id="extFile" accept=".json,.geojson" style="font-size:.62rem;color:#93a3bc;width:100%">
     <input type="text" id="extUrl" placeholder="…or a GeoJSON URL (CORS-enabled)" style="margin-top:6px">
@@ -4373,9 +4387,18 @@ function addExternalLayer(gj,label){
     });
   });
   if(!pos.length){
-    log(`Layer "${label}": ${rings.length} geometries read (${crs.kind}`+
-      `${crs.kind==='utm'?' zone '+crs.zone+(crs.south?'S':'N'):''}) but none fall inside `+
-      `the selected area`,'err');
+    // A polygon that CONTAINS the whole capture box has no edge inside
+    // it - that is coverage, not absence, so say which it is.
+    const inside=rings.some(r=>{
+      const poly=r.map(c=>{ const s=toScene(c); return {x:s.x,y:s.z}; });
+      return poly.length>2&&pointInPoly(poly,0,0);
+    });
+    log(inside
+      ? `Layer "${label}": the capture area lies entirely inside one feature - `+
+        `no boundary crosses this view (zoom out or pick a finer layer)`
+      : `Layer "${label}": ${rings.length} geometries read (${crs.kind}`+
+        `${crs.kind==='utm'?' zone '+crs.zone+(crs.south?'S':'N'):''}) but none fall `+
+        `inside the selected area`,'ai');
     return;
   }
   if(!extLayerGroup){ extLayerGroup=new THREE.Group(); scene.add(extLayerGroup); }
@@ -4408,6 +4431,53 @@ async function loadExternalLayer(){
     addExternalLayer(await res.json(),url.split('/').pop().slice(0,40)||'remote layer');
   }catch(e){ log('Layer URL: '+e.message,'err'); }
 }
+/* ---- curated South African open GIS layers ----
+   All four services below were verified to answer browser fetches with
+   CORS and to honour an esriGeometryEnvelope filter, so only the
+   features intersecting the capture box come down the wire. Sources:
+   Municipal Demarcation Board (national wards/municipalities) and the
+   City of Cape Town Open Data Portal. */
+const SA_LAYERS={
+  wards:{label:'MDB wards 2020',name:'ward',
+    url:'https://services7.arcgis.com/oeoyTUJC8HEeYsRB/arcgis/rest/services/MDB_Wards_2020/FeatureServer/0'},
+  munis:{label:'MDB local municipalities 2018',name:'municipality',
+    url:'https://services7.arcgis.com/oeoyTUJC8HEeYsRB/arcgis/rest/services/LocalMunicipalities2018_Final/FeatureServer/0'},
+  ctParks:{label:'Cape Town parks',name:'park',
+    url:'https://esapqa.capetown.gov.za/agsext/rest/services/Theme_Based/ODP_SPLIT_2/FeatureServer/3'},
+  ctZoning:{label:'Cape Town zoning',name:'zoning',
+    url:'https://services6.arcgis.com/nyYfO9SxHU2ChQd9/arcgis/rest/services/Zoning/FeatureServer/0'},
+  ctRail:{label:'Cape Town railway lines',name:'railway',
+    url:'https://esapqa.capetown.gov.za/agsext/rest/services/Theme_Based/ODP_SPLIT_12/FeatureServer/5'},
+  ctWater:{label:'Cape Town watercourses',name:'watercourse',
+    url:'https://esapqa.capetown.gov.za/agsext/rest/services/Theme_Based/ODP_SPLIT_3/FeatureServer/8'},
+};
+// Pure (unit-tested): bbox-filtered ArcGIS FeatureServer GeoJSON query
+function arcgisQueryUrl(base,b,max){
+  return base+'/query?where=1%3D1&outFields=*'+
+    '&geometry='+encodeURIComponent(`${b.W},${b.S},${b.E},${b.N}`)+
+    '&geometryType=esriGeometryEnvelope&inSR=4326'+
+    '&spatialRel=esriSpatialRelIntersects&outSR=4326&f=geojson'+
+    '&resultRecordCount='+(max||1000);
+}
+async function addSALayer(){
+  const key=$('saLayerSel').value;
+  if(!key) { log('Pick an open layer first','err'); return; }
+  if(appState!=='city'||!geoCtx){ log('Build a city first, then add the layer','err'); return; }
+  const L=SA_LAYERS[key];
+  $('saLayerBtn').textContent='fetching…';
+  try{
+    const r=await fetch(arcgisQueryUrl(L.url,geoCtx,1000));
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const gj=await r.json();
+    if(gj.error) throw new Error(gj.error.message||'service error');
+    const n=(gj.features||[]).length;
+    if(!n){ log(`${L.label}: no features in this area (the Cape Town layers `+
+      `only cover the City of Cape Town)`,'err'); return; }
+    addExternalLayer(gj,L.label);
+  }catch(e){ log(`${L.label}: `+e.message,'err'); }
+  finally{ $('saLayerBtn').innerHTML='&#127758; Add SA layer'; }
+}
+$('saLayerBtn').addEventListener('click',addSALayer);
 $('extBtn').addEventListener('click',loadExternalLayer);
 $('extClearBtn').addEventListener('click',()=>{ clearExtLayers(); log('External layers cleared','ai'); });
 window.__atlasAddLayer=(gj,label)=>addExternalLayer(gj,label||'test layer');
