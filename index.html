@@ -303,6 +303,21 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <input id="mapToken" type="password" placeholder="MLY|... (leave empty to skip)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
 
+    <label class="small">Aerial imagery source</label>
+    <select id="imgSourceSel">
+      <option value="auto" selected>Auto &mdash; NGI in South Africa, Esri elsewhere</option>
+      <option value="ngi">CD:NGI aerial &mdash; South Africa, near-nadir 0.5&nbsp;m</option>
+      <option value="esri">Esri World Imagery (global, current)</option>
+      <option value="wayback">Esri Wayback &mdash; older vintage&hellip;</option>
+      <option value="custom">Custom tile service (XYZ)&hellip;</option>
+    </select>
+    <select id="waybackSel" style="display:none;margin-top:6px"></select>
+    <input type="text" id="customTileUrl" placeholder="https://host/tiles/{z}/{x}/{y}.png"
+      style="display:none;margin-top:6px">
+    <p class="hint" id="imgSourceHint">NGI is the South African national aerial survey &mdash;
+      flown near-vertical, so rooftops sit on their footprints. Esri is global but often
+      oblique outside flagship cities.</p>
+
     <label class="small">OpenWeather API key (optional &mdash; live weather + air quality)</label>
     <input id="aqKey" type="password" placeholder="openweathermap.org key (empty = Open-Meteo + estimate)"
       style="width:100%;background:#0c1220;border:1px solid #2a3548;color:#fff;padding:9px;border-radius:7px;font-size:.72rem;outline:none;box-sizing:border-box">
@@ -504,7 +519,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
   <div class="bc-row"><span>Solar roof (est.)</span><b id="bcSolar">-</b></div>
   <div class="bc-hint">ESC or click empty ground to close</div>
 </div>
-<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather &amp; air quality: OpenWeather (with key) / Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE &middot; Crime sample: crimebrasil.com.br</div>
+<div id="attribution">&copy; OpenStreetMap contributors &middot; Imagery: Esri / CD:NGI (South Africa, via OSM-ZA) &middot; Routing: OSRM &middot; Geocoding: Nominatim &middot; Infra: OpenInfraMap &middot; Weather &amp; air quality: OpenWeather (with key) / Open-Meteo &middot; Radar: RainViewer &middot; Historic/night imagery: NASA GIBS &middot; Census/boundaries: IBGE &middot; Crime sample: crimebrasil.com.br</div>
 
 <!-- ================= LOADER ================= -->
 <div id="loader">
@@ -664,6 +679,43 @@ async function geocode(q){
     box.style.display='block';
   }catch(err){ log('Geocoding failed: '+err.message,'err'); }
 }
+/* ---- imagery source controls ---- */
+let waybackLoaded=false;
+async function loadWaybackReleases(){
+  if(waybackLoaded) return;
+  const sel=$('waybackSel');
+  sel.innerHTML='<option>loading vintages…</option>';
+  try{
+    const cfg=await (await fetch(
+      'https://s3-us-west-2.amazonaws.com/config.maptiles.arcgis.com/waybackconfig.json')).json();
+    const rows=Object.entries(cfg)
+      .map(([rel,v])=>({rel,title:(v.itemTitle||'').replace(/^World Imagery \(Wayback |\)$/g,'')}))
+      .filter(r=>/^\d{4}-\d{2}-\d{2}$/.test(r.title))
+      .sort((a,b)=>b.title.localeCompare(a.title));
+    sel.innerHTML=rows.map(r=>`<option value="${r.rel}">${r.title}</option>`).join('');
+    waybackRelease=rows.length?rows[0].rel:null;
+    waybackLoaded=true;
+    log(`Esri Wayback: ${rows.length} historical imagery vintages available`,'ai');
+  }catch(e){
+    sel.innerHTML='<option>unavailable</option>';
+    log('Esri Wayback list: '+e.message,'err');
+  }
+}
+$('imgSourceSel').addEventListener('change',async e=>{
+  imgSource=e.target.value;
+  $('waybackSel').style.display=imgSource==='wayback'?'block':'none';
+  $('customTileUrl').style.display=imgSource==='custom'?'block':'none';
+  if(imgSource==='wayback') await loadWaybackReleases();
+  const H={auto:'NGI inside South Africa, Esri everywhere else.',
+    ngi:'CD:NGI national aerial survey (~0.5m, near-vertical). South Africa only - '+
+        'other areas fall back to Esri. Research/demo use.',
+    esri:'Esri World Imagery: global and current, but often oblique outside flagship cities.',
+    wayback:'Older Esri captures - a different vintage is often flown at a different angle.',
+    custom:'Any XYZ tile template, e.g. a municipal orthophoto service. Must send CORS headers.'};
+  $('imgSourceHint').textContent=H[imgSource]||'';
+});
+$('waybackSel').addEventListener('change',e=>{ waybackRelease=e.target.value; });
+$('customTileUrl').addEventListener('input',e=>{ customTileUrl=e.target.value.trim(); });
 $('presetSelect').addEventListener('change',e=>{
   if(!e.target.value) return;
   const [lat,lon,...name]=e.target.value.split(',');
@@ -1000,11 +1052,54 @@ function localOSM(b){
 /* ============================================================
    DATA: SATELLITE TILE STITCHING (direct, CORS-safe)
 ============================================================ */
+/* ---- aerial imagery sources ----
+   Esri's global mosaic is convenient but often OFF-NADIR outside its
+   flagship cities: buildings lean, so the pixels over a footprint show
+   a facade instead of the roof. Where a near-nadir national orthophoto
+   exists we prefer it. South Africa has one: the Chief Directorate
+   National Geo-spatial Information (CD:NGI) 0.5m aerial survey.
+     1. NGI      - inside South Africa, near-nadir, ~0.5m (research use)
+     2. Wayback  - 196 historical Esri releases; an older vintage is
+                   often flown at a different angle
+     3. custom   - any XYZ template, e.g. a municipal ortho service
+   "auto" picks NGI inside SA and Esri elsewhere. */
+const SA_BOUNDS={S:-35.0,N:-22.0,W:16.3,E:33.1};
+const IMG_SRC={
+  esri:{label:'Esri World Imagery',maxZ:19,
+    url:(z,x,y)=>`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`},
+  ngi:{label:'CD:NGI aerial (South Africa)',maxZ:20,bounds:SA_BOUNDS,
+    url:(z,x,y)=>`https://aerial.openstreetmap.org.za/ngi-aerial/${z}/${x}/${y}.png`},
+};
+let imgSource='auto', waybackRelease=null, customTileUrl='';
+function inBounds(b,bb){ return b&&bb&&b.cLat>=bb.S&&b.cLat<=bb.N&&b.cLon>=bb.W&&b.cLon<=bb.E; }
+// Pure (unit-tested): which source serves this capture box?
+function pickImagerySource(sel,b,hasWayback,hasCustom){
+  if(sel==='custom'&&hasCustom) return 'custom';
+  if(sel==='wayback'&&hasWayback) return 'wayback';
+  if(sel==='ngi') return inBounds(b,SA_BOUNDS)?'ngi':'esri';
+  if(sel==='esri') return 'esri';
+  return inBounds(b,SA_BOUNDS)?'ngi':'esri';        // auto
+}
+let activeImgSource='esri';
+function tileUrl(z,x,y){
+  if(activeImgSource==='custom')
+    return customTileUrl.replace('{z}',z).replace('{x}',x).replace('{y}',y);
+  if(activeImgSource==='wayback')
+    return `https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/`+
+      `WMTS/1.0.0/default028mm/MapServer/tile/${waybackRelease}/${z}/${y}/${x}`;
+  return (IMG_SRC[activeImgSource]||IMG_SRC.esri).url(z,x,y);
+}
+function imagerySourceLabel(){
+  if(activeImgSource==='custom') return 'custom tile service';
+  if(activeImgSource==='wayback')
+    return 'Esri Wayback '+(($('waybackSel').selectedOptions[0]||{}).textContent||'').trim();
+  return (IMG_SRC[activeImgSource]||IMG_SRC.esri).label;
+}
 function loadTile(z,x,y){
   return new Promise(resolve=>{
     const img=new Image(); img.crossOrigin='anonymous';
     img.onload=()=>resolve(img); img.onerror=()=>resolve(null);
-    img.src=`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+    img.src=tileUrl(z,x,y);
   });
 }
 async function stitchSatelliteAt(b,z){
@@ -1057,15 +1152,27 @@ async function fetchSatellite(b){
   // high/medium GPUs). Start at z19 (~0.3m/px) where Esri has it -
   // rooftops sample the mosaic directly, so this is what makes them
   // sharp; the ok-tiles check below steps down where z19 is missing.
-  let z=19;
+  activeImgSource=pickImagerySource(imgSource,b,!!waybackRelease,!!customTileUrl);
   const maxPx=gfxTier==='low'?2600:3200;
-  while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > maxPx) z--;
-  // Esri has no high-zoom imagery for many smaller towns: if most tiles
-  // 404 at this zoom, step down until the mosaic actually fills in.
+  const pickZoom=()=>{
+    let z=Math.min(19,(IMG_SRC[activeImgSource]||{}).maxZ||19);
+    while(z>15 && (lon2tile(b.E,z)-lon2tile(b.W,z))*256 > maxPx) z--;
+    return z;
+  };
+  let z=pickZoom();
+  // Not every source covers every place at every zoom: if most tiles
+  // 404, step down; if the chosen source has nothing here at all, fall
+  // back to Esri so a build never lands with a blank ground plane.
   let s=await stitchSatelliteAt(b,z);
   while(s.okTiles<s.total*0.5 && z>13){
     log(`Satellite: only ${s.okTiles}/${s.total} tiles at z${z} - retrying z${z-1}`,'ai');
     z--; s=await stitchSatelliteAt(b,z);
+  }
+  if(s.okTiles<s.total*0.5&&activeImgSource!=='esri'){
+    log(`${imagerySourceLabel()}: no usable tiles here - falling back to Esri`,'err');
+    activeImgSource='esri'; z=pickZoom();
+    s=await stitchSatelliteAt(b,z);
+    while(s.okTiles<s.total*0.5 && z>13){ z--; s=await stitchSatelliteAt(b,z); }
   }
   const imgData=s.canvas.getContext('2d').getImageData(0,0,s.w,s.h);
   // enhance the DISPLAYED mosaic (ground + rooftops): gentle saturation +
@@ -1076,7 +1183,8 @@ async function fetchSatellite(b){
   const texture=new THREE.CanvasTexture(s.canvas);
   texture.colorSpace=THREE.SRGBColorSpace;
   texture.anisotropy=renderer.capabilities.getMaxAnisotropy();
-  log(`Satellite mosaic: ${s.okTiles}/${s.total} tiles @ z${z} (${s.w}x${s.h}px)`,'ok');
+  log(`Aerial imagery: ${imagerySourceLabel()} - ${s.okTiles}/${s.total} tiles `+
+    `@ z${z} (${s.w}x${s.h}px, ~${(geoCtx?geoCtx.sceneW/s.w:0).toFixed(2)}m/px)`,'ok');
   if(s.okTiles<s.total)
     log('Some satellite tiles are unavailable here - gaps stay dark grey','ai');
   return {texture,imgData,w:s.w,h:s.h};
