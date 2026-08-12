@@ -14,8 +14,11 @@ function scanLean(scoreFn){
     }
   return {s0,best};
 }
+// Scores are NEGATIVE alignment quality (scanLean minimises), so a real
+// improvement means the magnitude grew by at least 12%.
 function acceptLean(s0,best){
-  return best.sc<s0*0.9&&Math.hypot(best.lx,best.lz)>=0.02;
+  if(!(s0<0)) return false;
+  return best.sc<s0*1.12&&Math.hypot(best.lx,best.lz)>=0.02;
 }
 
 let pass=0, fail=0;
@@ -25,36 +28,40 @@ function check(name,cond,detail){
 }
 
 console.log('=== two-stage argmin scan ===');
-// paraboloid with a known minimum at (0.12, -0.08)
-const para=(lx,lz)=>100+((lx-0.12)**2+(lz+0.08)**2)*5000;
-const r1=scanLean(para);
-check('finds the minimum within fine-step resolution',
+// Alignment quality peaks at (0.12,-0.08) and decays toward 0 away from
+// it; the score is its negative, so it is always <= 0 - matching the real
+// metric, where the score is -mean(edge contrast).
+const peak=(lx,lz)=>-50/(1+((lx-0.12)**2+(lz+0.08)**2)*500);
+const r1=scanLean(peak);
+check('finds the optimum within fine-step resolution',
   Math.abs(r1.best.lx-0.12)<=0.011&&Math.abs(r1.best.lz+0.08)<=0.011,
   JSON.stringify(r1.best));
-check('s0 is the no-lean baseline', Math.abs(r1.s0-para(0,0))<1e-9);
-check('clear minimum accepted', acceptLean(r1.s0,r1.best)===true);
+check('s0 is the no-lean baseline', Math.abs(r1.s0-peak(0,0))<1e-9);
+check('clear improvement accepted', acceptLean(r1.s0,r1.best)===true);
 
 console.log('=== true-ortho imagery stays uncorrected ===');
-// flat-ish score surface: no lean is meaningfully better than zero
-const flat=(lx,lz)=>100+(lx*lx+lz*lz)*3;   // minimum AT zero
+// alignment already best at zero: shifting only makes it worse
+const flat=(lx,lz)=>-(50-(lx*lx+lz*lz)*3);
 const r2=scanLean(flat);
-check('flat surface: zero (or trivial) vector found',
+check('optimum is at (or next to) zero',
   Math.hypot(r2.best.lx,r2.best.lz)<0.06, JSON.stringify(r2.best));
-check('no significant improvement -> rejected (Manhattan case)',
+check('no meaningful gain -> rejected (true-ortho case)',
   acceptLean(r2.s0,r2.best)===false);
-// noisy surface with a shallow off-zero dip: improvement under 10%
-const shallow=(lx,lz)=>(Math.abs(lx-0.2)<0.011&&Math.abs(lz)<0.011)?95:100;
+// a shallow off-zero dip worth under 12% must not trigger a correction
+const shallow=(lx,lz)=>(Math.abs(lx-0.2)<0.011&&Math.abs(lz)<0.011)?-53:-50;
 const r3=scanLean(shallow);
-check('sub-10% improvement rejected even at a real dip',
+check('sub-12% improvement rejected even at a real dip',
   acceptLean(r3.s0,r3.best)===false, JSON.stringify(r3));
 
 console.log('=== strong lean accepted, tiny vectors rejected ===');
-const strong=(lx,lz)=>(Math.abs(lx-0.15)<0.011&&Math.abs(lz-0.1)<0.011)?40:100;
+const strong=(lx,lz)=>(Math.abs(lx-0.15)<0.011&&Math.abs(lz-0.1)<0.011)?-120:-50;
 const r4=scanLean(strong);
-check('strong dip found and accepted',
+check('strong alignment peak found and accepted',
   acceptLean(r4.s0,r4.best)===true&&Math.abs(r4.best.lx-0.15)<=0.011);
 check('near-zero vector rejected regardless of score',
-  acceptLean(100,{lx:0.01,lz:0.005,sc:40})===false);
+  acceptLean(-50,{lx:0.01,lz:0.005,sc:-120})===false);
+check('degenerate baseline (no usable towers) rejected',
+  acceptLean(1e9,{lx:0.3,lz:0.3,sc:-10})===false);
 
 console.log(fail===0?'ALL PASS ('+pass+' checks)':'FAIL ('+fail+')');
 process.exit(fail===0?0:1);

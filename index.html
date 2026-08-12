@@ -887,20 +887,30 @@ function matchHeightsToBuildings(builds,samples,tolM){
 const OVERPASS_MIRRORS=['https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'];
+// Height enrichment must NEVER hold up the build: Overpass is a busy
+// public service and the city has to appear regardless. Each mirror gets
+// a short abortable window, and the whole lookup is capped.
+const OSM_HEIGHT_BUDGET_MS=14000;
 async function fetchOSMHeights(b){
-  const q=`[out:json][timeout:25];(`+
+  const q=`[out:json][timeout:20];(`+
     `way["building"]["height"](${b.S},${b.W},${b.N},${b.E});`+
     `way["building"]["building:levels"](${b.S},${b.W},${b.N},${b.E});`+
     `);out tags center;`;
+  const deadline=performance.now()+OSM_HEIGHT_BUDGET_MS;
   let last='';
   for(const url of OVERPASS_MIRRORS){
+    const left=deadline-performance.now();
+    if(left<1500){ last=last||'time budget exhausted'; break; }
+    const ctl=new AbortController();
+    const timer=setTimeout(()=>ctl.abort(),left);
     try{
-      const r=await fetch(url,{method:'POST',body:q});
+      const r=await fetch(url,{method:'POST',body:q,signal:ctl.signal});
+      clearTimeout(timer);
       if(!r.ok){ last='HTTP '+r.status; continue; }
       return parseOverpassHeights(await r.json());
-    }catch(e){ last=e.message; }
+    }catch(e){ clearTimeout(timer); last=e.name==='AbortError'?'timed out':e.message; }
   }
-  throw new Error(last+' (all Overpass mirrors)');
+  throw new Error(last+' (Overpass)');
 }
 // attach fetched heights to an already-parsed offline dataset
 function applyOSMHeights(data,samples){
@@ -942,7 +952,8 @@ function localOSM(b){
     const h=lidarHeightAt(lidar,sl/ring.length,sn/ring.length);
     if(h>=3){ w.tags.height=String(h); w.tags['lidar:height']='1'; lidarCount++; }
   };
-  a.b.forEach(([typ,ring,syn])=>{
+  let bundledH=0;
+  a.b.forEach(([typ,ring,syn,h])=>{
     if(!inBox(ring)) return;
     // dataset synthetic boxes are no longer used - synthetic infill is
     // now traced from roofs DETECTED in the satellite image instead
@@ -950,9 +961,13 @@ function localOSM(b){
     if(syn) return;
     const w={type:'way',id:wid++,nodes:ring.map(([lat,lon])=>addNode(lat,lon)),
       tags:{building:typ||'yes'}};
-    applyLidar(w,ring);
+    // real OSM z-index baked into the bundle (PBF-derived extracts keep
+    // the full tag set; shapefile-derived ones have none)
+    if(h>0){ w.tags.height=String(h); w.tags['osm:height']='1'; bundledH++; }
+    else applyLidar(w,ring);
     data.waysById[w.id]=w; data.elements.push(w);
   });
+  data.bundledHeights=bundledH;
   // Microsoft ML footprints: standardized polygons filling gaps where OSM
   // has no building (deduped offline). ML height rides along when known;
   // unknown heights fall through to the shadow/typology extrusion pipeline.
@@ -967,10 +982,13 @@ function localOSM(b){
     data.waysById[w.id]=w; data.elements.push(w); msCount++;
   });
   data.msCount=msCount; data.lidarCount=lidarCount;
-  a.r.forEach(([fc,pts])=>{
+  a.r.forEach(([fc,pts,nm])=>{
     if(!inBox(pts)) return;
     const w={type:'way',id:wid++,nodes:pts.map(([lat,lon])=>addNode(lat,lon)),
       tags:{highway:fc}};
+    // PBF-derived extracts carry the street name, so labels render
+    // offline instead of waiting on a live Overpass name query
+    if(nm) w.tags.name=nm;
     data.waysById[w.id]=w; data.elements.push(w);
   });
   a.t.forEach(([lat,lon])=>{
@@ -1835,8 +1853,11 @@ function scanLean(scoreFn){
 // Pure (unit-tested): adopt only a CLEAR improvement over no-lean, and
 // only a non-trivial vector - otherwise the imagery is true-ortho and
 // noise-chasing would smear correct roofs
+// Scores are NEGATIVE alignment quality (scanLean minimises), so a real
+// improvement means the magnitude grew by at least 12%.
 function acceptLean(s0,best){
-  return best.sc<s0*0.9&&Math.hypot(best.lx,best.lz)>=0.02;
+  if(!(s0<0)) return false;
+  return best.sc<s0*1.12&&Math.hypot(best.lx,best.lz)>=0.02;
 }
 function estimateRoofLean(prepared){
   satLean={x:0,z:0};
@@ -1860,37 +1881,60 @@ function estimateRoofLean(prepared){
     const i=(Math.floor(v*satData.h)*satData.w+Math.floor(u*satData.w))*4;
     return 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
   };
+  // Sample the footprint shrunk to 0.6 (certainly ON the roof) and grown
+  // to 1.5 (certainly OFF it). The right lean is where those two sets
+  // differ most while the roof itself stays uniform - i.e. the polygon
+  // lands on a real image edge. Plain variance minimisation was NOT a
+  // sound metric: a smooth car park scores as well as a roof, and for a
+  // 223m tower (118m of displacement) it happily picked one.
   const T=towers.map(t=>{
     const cx=(t.sLon-cLon)*mPerLon, cz=(cLat-t.sLat)*M_LAT;
-    const pts=[[cx,cz]];
-    const step=Math.max(1,Math.ceil(t.pts.length/8));
-    for(let i=0;i<t.pts.length;i+=step)
-      pts.push([cx+(t.pts[i].x-cx)*0.45, cz+(t.pts[i].y-cz)*0.45]);
-    return {pts,h:t.finalH||t.typologyH};
+    const inner=[[cx,cz]], outer=[];
+    const step=Math.max(1,Math.ceil(t.pts.length/10));
+    for(let i=0;i<t.pts.length;i+=step){
+      inner.push([cx+(t.pts[i].x-cx)*0.6, cz+(t.pts[i].y-cz)*0.6]);
+      outer.push([cx+(t.pts[i].x-cx)*1.5, cz+(t.pts[i].y-cz)*1.5]);
+    }
+    return {inner,outer,h:t.finalH||t.typologyH};
   });
-  const score=(lx,lz)=>{             // mean per-tower luminance variance
+  // higher = better alignment; scanLean minimises, so return the negative
+  const score=(lx,lz)=>{
     let sum=0,n=0;
     for(const t of T){
-      let s=0,s2=0,k=0;
-      for(const [x,z] of t.pts){
-        const L=lumAt(x+lx*t.h, z+lz*t.h);
-        if(L==null) continue;
-        s+=L; s2+=L*L; k++;
+      const dx=lx*t.h, dz=lz*t.h;
+      let si=0,si2=0,ki=0,so=0,ko=0;
+      for(const [x,z] of t.inner){
+        const L=lumAt(x+dx,z+dz); if(L==null) continue;
+        si+=L; si2+=L*L; ki++;
       }
-      if(k>=4){ sum+=s2/k-(s/k)*(s/k); n++; }
+      for(const [x,z] of t.outer){
+        const L=lumAt(x+dx,z+dz); if(L==null) continue;
+        so+=L; ko++;
+      }
+      if(ki<4||ko<4) continue;
+      const mi=si/ki, mo=so/ko;
+      const vi=Math.max(0,si2/ki-mi*mi);
+      sum+=Math.abs(mi-mo)/(1+Math.sqrt(vi));   // edge contrast, uniformity-weighted
+      n++;
     }
-    return n?sum/n:1e9;
+    return n?-sum/n:1e9;
   };
   const {s0,best}=scanLean(score);
+  if(window.__atlasForceLean){            // debug override for A/B checks
+    satLean={x:window.__atlasForceLean.x,z:window.__atlasForceLean.z};
+    window.__atlasLeanStats={forced:true,lx:satLean.x,lz:satLean.z,adopted:true};
+    log(`Ortho-lean FORCED to ${satLean.x}, ${satLean.z} (debug)`,'ai');
+    return;
+  }
   window.__atlasLeanStats={towers:T.length,score0:Math.round(s0),
     score:Math.round(best.sc),lx:+best.lx.toFixed(3),lz:+best.lz.toFixed(3),
     adopted:acceptLean(s0,best)};
   if(acceptLean(s0,best)){
     satLean={x:best.lx,z:best.lz};
     const az=((Math.atan2(best.lx,-best.lz)*180/Math.PI)+360)%360;
-    log(`Ortho-lean correction: roofs displaced ${Math.hypot(best.lx,best.lz).toFixed(2)}m `+
-      `per metre of height toward ${Math.round(az)}deg (estimated from ${T.length} towers, `+
-      `roof-patch variance ${Math.round(s0)}->${Math.round(best.sc)}) - rooftop sampling corrected`,'ai');
+    log(`Imagery obliquity: ~${Math.hypot(best.lx,best.lz).toFixed(2)}m per metre of `+
+      `height toward ${Math.round(az)}deg (from ${T.length} towers) - used to read `+
+      `facades for floor counting; rooftops sample their own footprint`,'ai');
   }else{
     log('Ortho-lean: no significant roof displacement detected - imagery is effectively true-ortho here','ai');
   }
@@ -2265,11 +2309,16 @@ function buildBuildings(osm){
       const k1=ek(A.x,A.y), k2=ek(B.x,B.y);
       edgeWin.set(k1<k2?k1+'|'+k2:k2+'|'+k1,windowCols(len));
     }
-    // rooftop sampling position: leaned by height for REAL buildings so
-    // the photographed (displaced) roof lands back on its footprint.
-    // Detected-roof synthetics are traced AT the photographed position,
-    // so their caps sample unshifted.
-    const leanX=p.isSyn?0:satLean.x*h, leanZ=p.isSyn?0:satLean.z*h;
+    // Rooftop = the satellite image EXACTLY over this footprint - the
+    // same pixels the 2D map shows before extrusion, which is what the
+    // roof must be. An earlier build shifted this sample by an estimated
+    // off-nadir lean; that was wrong in practice: a single global vector
+    // cannot describe displacement that scales with height, and on tall
+    // towers it threw the sample onto neighbouring blocks (the Empire
+    // State's roof landed on a street, Carlton Centre's on a car park).
+    // The lean is still ESTIMATED - facade window-counting needs its
+    // direction - but it no longer moves rooftop sampling.
+    const leanX=0, leanZ=0;
     for(const g of geom.groups){
       if(g.materialIndex===0){                      // caps: satellite
         for(let i=g.start;i<g.start+g.count;i++)
@@ -3919,6 +3968,24 @@ window.__atlasCard=async(name,title,lines)=>{
   }catch(e){ return 'collector offline'; }
 };
 // synthetic-infill state (user rule: hidden until clicked)
+// look straight down on the tallest building of a given height source -
+// used to inspect that the roof really is that building's satellite image
+window.__atlasLookDownTallest=(src,alt)=>{
+  let best=null;
+  cityGroup.children.forEach(m=>{
+    if(!m.userData||!m.userData.h) return;
+    if(src&&m.userData.src!==src) return;
+    if(!best||m.userData.h>best.userData.h) best=m;
+  });
+  if(!best) return null;
+  const u=best.userData;
+  camAnim=null; controls.autoRotate=false;   // cancel the cinematic entrance
+  const x=(u.lon-geoCtx.cLon)*geoCtx.mPerLon, z=(geoCtx.cLat-u.lat)*M_LAT;
+  camera.position.set(x+1,u.h+(alt||Math.max(60,u.h*0.7)),z+1);
+  controls.target.set(x,u.h,z);
+  controls.update();
+  return {h:Math.round(u.h),src:u.src,areaM2:u.area,lat:u.lat,lon:u.lon};
+};
 window.__atlasSynState=()=>({visible:synGroup.visible,
   count:synGroup.children.length,btn:$('synBtn').textContent});
 // selected-area confinement: max overhang of any building vertex / road
@@ -5918,14 +5985,21 @@ $('buildBtn').addEventListener('click',async()=>{
     const [osm,sat,heights]=await Promise.all([
       local?Promise.resolve(local.data):fetchOSM(b),
       fetchSatellite(b),
-      local?fetchOSMHeights(b).catch(e=>{
+      // only ask Overpass when the offline bundle brought no heights
+      // (PBF-derived extracts already carry them - no request, no rate
+      // limiting, faster build); shapefile-derived zones still enrich
+      (local&&!local.data.bundledHeights)?fetchOSMHeights(b).catch(e=>{
         log('OSM heights: '+e.message+' - falling back to estimation','err');
         return null; }):Promise.resolve(null)]);
     satData=sat;
+    if(local&&osm.bundledHeights)
+      log(`OSM z-index: ${osm.bundledHeights} buildings carry real heights `+
+        `from the offline PBF extract`,'ok');
     if(local&&heights&&heights.length){
       const r=applyOSMHeights(osm,heights);
-      log(`OSM z-index: ${r.applied} buildings tagged from ${r.samples} live `+
-        `Overpass height records`+(r.fromLevels?` (${r.fromLevels} via building:levels)`:''),'ok');
+      if(r.applied)
+        log(`OSM z-index: +${r.applied} buildings tagged from ${r.samples} live `+
+          `Overpass height records`+(r.fromLevels?` (${r.fromLevels} via building:levels)`:''),'ok');
     }
     step('s2','done'); step('s3','done'); step('s4','doing');
     const buildingCount=osm.elements.filter(e=>e.type==='way'&&e.tags&&e.tags.building).length;
