@@ -434,6 +434,7 @@ button:disabled{background:#1b2334;color:#54617a;cursor:not-allowed;box-shadow:n
     <button id="routeBtn" class="gold" style="margin-top:14px">&#9673; Plot Route (OSRM)</button>
     <div id="routeInfo"></div>
     <button id="synBtn" class="ghost" style="display:none">Synthetic infill: OFF</button>
+    <button id="mlBtn" class="ghost" style="display:none">ML footprints: ON</button>
     <div class="btn-row">
       <button id="shotBtn" class="ghost">&#128247; Postcard</button>
       <button id="glbBtn" class="ghost">&#11015; 3D model (.glb)</button>
@@ -587,6 +588,7 @@ let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let facadeAnim = [], facadeTickT = 0, facadeTickI = 0, nightNow = 0, roofMatLive = null;
 let lodGroup = null, lodTiles = [], lodWallMat = null;
+let mlVisible = true, mlCountLive = 0;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
@@ -2347,7 +2349,12 @@ function buildBuildings(osm){
     prepared.push({ id:bld.id, tags:bld.tags, pts, area, sLat, sLon,
       radius:Math.sqrt(area/Math.PI), typologyH:est.h, tagged:est.tagged,
       knownH:est.tagged?est.h:0, minH, rand,
-      isSyn:bld.tags['atlas:synthetic']==='1' });
+      isSyn:bld.tags['atlas:synthetic']==='1',
+      // Microsoft ML footprints are MACHINE-DERIVED from imagery, not
+      // surveyed. They are a legitimate dataset (rule: OSM "or other
+      // datasets") but they are not human-mapped, so they get the same
+      // plausibility guards as generated geometry and are counted apart.
+      isML:bld.tags['ms:footprint']==='1' });
   });
 
   // ---- shadow calibration + refinement of untagged heights ----
@@ -2365,6 +2372,47 @@ function buildBuildings(osm){
       p.shadow=true; refined++;
     }
     log(`Shadow model: sun elev ~${model.elevDeg.toFixed(0)}deg, ${model.n} OSM control pts (r=${model.corr.toFixed(2)})`,'ai');
+  }
+
+  /* ---- ML footprint plausibility pass ----
+     Microsoft's ML footprints are traced by a model from imagery, and
+     where its registration drifts they land beside - or across the
+     street from - the building they describe. OSM already covers many
+     of those buildings, so the drifted copy shows up as a SECOND
+     building next to a real one. Offline dedupe removes exact overlaps
+     but not offset ones, so reject any ML footprint whose centre lies
+     inside a human-mapped OSM footprint, or whose centre sits within
+     one of its own radii of an OSM centre. Human-surveyed rings always
+     win; nothing here touches OSM data. */
+  {
+    const CELL=40, hash=new Map();
+    const key=(x,z)=>Math.floor(x/CELL)+','+Math.floor(z/CELL);
+    const osmOnly=prepared.filter(p=>!p.isML&&!p.isSyn);
+    osmOnly.forEach(p=>{
+      const cx=(p.sLon-cLon)*mPerLon, cz=(cLat-p.sLat)*M_LAT;
+      const k=key(cx,cz);
+      if(!hash.has(k)) hash.set(k,[]);
+      hash.get(k).push({p,cx,cz});
+    });
+    let dropped=0;
+    const kept=prepared.filter(p=>{
+      if(!p.isML) return true;
+      const cx=(p.sLon-cLon)*mPerLon, cz=(cLat-p.sLat)*M_LAT;
+      const gx=Math.floor(cx/CELL), gz=Math.floor(cz/CELL);
+      for(let dx=-1;dx<=1;dx++) for(let dz=-1;dz<=1;dz++){
+        const bucket=hash.get((gx+dx)+','+(gz+dz));
+        if(!bucket) continue;
+        for(const o of bucket){
+          if(Math.hypot(o.cx-cx,o.cz-cz)<Math.max(p.radius,o.p.radius)){ dropped++; return false; }
+          if(pointInPoly(o.p.pts,cx,cz)){ dropped++; return false; }
+        }
+      }
+      return true;
+    });
+    if(dropped){
+      prepared.length=0; kept.forEach(p=>prepared.push(p));
+      log(`- ${dropped} ML footprints dropped (duplicate/offset copy of an OSM-mapped building)`,'ai');
+    }
   }
 
   // ---- synthetic infill from DETECTED ROOFS ----
@@ -2402,9 +2450,16 @@ function buildBuildings(osm){
   }catch(e){ log('Facade floor-count failed: '+e.message,'err'); }
 
   // ---- pass 2: extrude ----
-  let count=0, tallest=0, tagged=0, synCount=0, synDropped=0;
+  let count=0, tallest=0, tagged=0, synCount=0, synDropped=0, mlCount=0, mlDropped=0;
   prepared.forEach(p=>{
-    if(p.isSyn&&footprintOnRoad(p.pts,roadSamplesNear(p.pts))){ synDropped++; return; }
+    // A building standing in a carriageway is always wrong - traffic
+    // would drive through it. Human-surveyed OSM rings are trusted, but
+    // every machine-derived footprint (roof-detection synthetic AND
+    // Microsoft ML) must clear the road corridor.
+    if((p.isSyn||p.isML)&&footprintOnRoad(p.pts,roadSamplesNear(p.pts))){
+      if(p.isSyn) synDropped++; else mlDropped++;
+      return;
+    }
     const h=p.finalH||p.typologyH;
     const minH=clamp(p.minH,0,h-1);
     if(p.tagged) tagged++;
@@ -2500,7 +2555,7 @@ function buildBuildings(osm){
     if(ring.length>1&&Math.hypot(ring[0][0]-ring[ring.length-1][0],
        ring[0][1]-ring[ring.length-1][1])<1e-6) ring.pop();
     mesh.userData={h,minH,lat:p.sLat,lon:p.sLon,shadow:!!p.shadow,facadeAz,
-      area:Math.round(p.area), ring, leanX, leanZ,
+      area:Math.round(p.area), ring, leanX, leanZ, ml:!!p.isML,
       src:p.tagged?(p.tags['lidar:height']?'lidar':(p.tags['ms:footprint']?'ms':'osm'))
          :(p.facade?'facade':p.shadow?'shadow':'typo')};   // height provenance
 
@@ -2511,7 +2566,8 @@ function buildBuildings(osm){
       if(pollutionCtx.stacks.length<40&&(btype==='industrial'||btype==='factory'))
         pollutionCtx.stacks.push({x:(p.sLon-cLon)*mPerLon, z:(cLat-p.sLat)*M_LAT, h});
     }
-    if(p.isSyn){ synCount++; synGroup.add(mesh); } else cityGroup.add(mesh);
+    if(p.isSyn){ synCount++; synGroup.add(mesh); }
+    else { if(p.isML){ mlCount++; mesh.visible=mlVisible; } cityGroup.add(mesh); }
     count++;
   });
 
@@ -2531,6 +2587,16 @@ function buildBuildings(osm){
   // the default view shows only real mapped footprints)
   synGroup.visible=false;
   $('synBtn').textContent='Synthetic infill: OFF';
+  // ML footprints are machine-derived, so say so plainly instead of
+  // folding them into "real footprints", and let them be switched off
+  mlCountLive=mlCount;
+  $('mlBtn').style.display=mlCount?'block':'none';
+  $('mlBtn').textContent=`ML footprints (${mlCount}): ${mlVisible?'ON':'OFF'}`;
+  if(mlCount)
+    log(`${real-mlCount} OSM-mapped + ${mlCount} Microsoft ML footprints `+
+      `(machine-derived from imagery - toggle separately)`,'ai');
+  if(mlDropped)
+    log(`- ${mlDropped} ML footprints dropped (overlapped a road corridor)`,'ai');
   $('synBtn').style.display=synCount?'block':'none';
   log(`Extruded ${real} real footprints (${tagged} OSM z-tagged`+(refined?`, ${refined} shadow-estimated`:'')+`)`,'ok');
   if(synCount) log(`+ ${synCount} SYNTHETIC infill buildings (borders traced from satellite roof detection)`,'ai');
@@ -4113,6 +4179,35 @@ window.__atlasLookDownTallest=(src,alt)=>{
 };
 window.__atlasSynState=()=>({visible:synGroup.visible,
   count:synGroup.children.length,btn:$('synBtn').textContent});
+// provenance census of what is ACTUALLY on screen: every visible building
+// grouped by height source, plus any that sit on a drivable road corridor
+window.__atlasProvenance=()=>{
+  const bySrc={}, onRoad=[];
+  // A cityGroup member hidden by LOD is still ON SCREEN via its merged
+  // tile, so LOD visibility must not be read as "not rendered". Only the
+  // synthetic group's own toggle actually removes buildings from view.
+  const shown=cityGroup.children.concat(synGroup.visible?synGroup.children:[]);
+  shown.forEach(m=>{
+    if(!m.userData||!m.userData.ring) return;
+    const s=m.userData.src||'?';
+    bySrc[s]=(bySrc[s]||0)+1;
+    // centroid distance to the nearest drivable carriageway centreline:
+    // a footprint whose centre sits inside the road surface is standing
+    // in the street
+    let cx=0,cz=0; m.userData.ring.forEach(([x,z])=>{ cx+=x; cz+=z; });
+    cx/=m.userData.ring.length; cz/=m.userData.ring.length;
+    let best=1e9, bestHw=0;
+    trafficPaths.forEach(p=>p.pts.forEach(pt=>{
+      const d=Math.hypot(pt.x-cx,pt.z-cz);
+      if(d<best){ best=d; bestHw=p.hw; }
+    }));
+    if(best<bestHw)
+      onRoad.push({src:s,area:m.userData.area,distM:+best.toFixed(1),
+        roadHalfWidth:bestHw,lat:m.userData.lat,lon:m.userData.lon});
+    m.userData._provCx=cx; m.userData._provCz=cz;
+  });
+  return {bySrc,onRoadCount:onRoad.length,onRoad:onRoad.slice(0,10)};
+};
 // selected-area confinement: max overhang of any building vertex / road
 // point beyond the golden frame, in metres (0 = fully confined)
 window.__atlasBoundsCheck=()=>{
@@ -5122,6 +5217,14 @@ function setRouteMode(on){
   $('routeCursor').style.display=on?'block':'none';
   controls.enableRotate=!on;
 }
+$('mlBtn').addEventListener('click',e=>{
+  mlVisible=!mlVisible;
+  cityGroup.children.forEach(m=>{ if(m.userData&&m.userData.ml) m.visible=mlVisible; });
+  buildLOD();          // merged far tiles must be rebuilt without them
+  e.target.textContent=`ML footprints (${mlCountLive}): ${mlVisible?'ON':'OFF'}`;
+  log(`Microsoft ML footprints ${mlVisible?'shown':'hidden'} - `+
+    `${mlVisible?'machine-derived from imagery':'only human-mapped OSM footprints remain'}`,'ai');
+});
 $('synBtn').addEventListener('click',e=>{
   synGroup.visible=!synGroup.visible;
   e.target.textContent='Synthetic infill: '+(synGroup.visible?'ON':'OFF');
@@ -6245,6 +6348,7 @@ $('resetBtn').addEventListener('click',()=>{
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
   clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=false;
   clearGroup(lodGroup); lodTiles=[];
+  mlVisible=true; mlCountLive=0; $('mlBtn').style.display='none';
   $('synBtn').textContent='Synthetic infill: OFF';
   plannerClear();
   removeTraffic();
@@ -6341,6 +6445,7 @@ function buildLOD(){
   cityGroup.children.forEach(m=>{
     const r=m.userData&&m.userData.ring;
     if(!r||!r.length) return;
+    if(m.userData.ml&&!mlVisible) return;   // hidden ML stays out of the merge
     let cx=0,cz=0; r.forEach(([x,z])=>{ cx+=x; cz+=z; });
     members[lodTileIndex(cx/r.length,cz/r.length,halfW,halfH,LOD_TILES)].push(m);
   });
@@ -6382,9 +6487,53 @@ function lodTick(){
     const far=lodModeFor(Math.sqrt(dx*dx+dy*dy+dz*dz),LOD_NEAR,LOD_HYST,t.far);
     if(far===t.far) continue;
     t.far=far; t.merged.visible=far;
-    for(const m of t.members) m.visible=!far;
+    // never un-hide a building the user switched off (ML layer)
+    for(const m of t.members)
+      m.visible=!far&&(!m.userData.ml||mlVisible);
   }
 }
+// integrity of the merged far-tile geometry: group slicing assumes
+// NON-indexed source geometry (group.start indexes vertices, not
+// indices). If any building geometry were indexed the merge would
+// scramble triangles across the tile - assert it here.
+window.__atlasLODIntegrity=()=>{
+  // compare against the meshes the merge is ELIGIBLE to include - ML
+  // buildings the user switched off are deliberately absent from it
+  const eligible=cityGroup.children.filter(m=>!(m.userData.ml&&!mlVisible));
+  const indexed=eligible.filter(m=>m.geometry.index).length;
+  let srcRoofVerts=0, srcWallVerts=0;
+  eligible.forEach(m=>{
+    m.geometry.groups.forEach(g=>{
+      if(g.materialIndex===0) srcRoofVerts+=g.count; else srcWallVerts+=g.count; });
+  });
+  let mergedRoofVerts=0, mergedWallVerts=0;
+  lodTiles.forEach(t=>t.merged.children.forEach((m,i)=>{
+    const n=m.geometry.attributes.position.count;
+    if(m.material===roofMatLive) mergedRoofVerts+=n; else mergedWallVerts+=n; }));
+  // UV survival: a merged roof that lost its uv attribute (or collapsed
+  // it to a constant) would sample one pixel and render flat-coloured -
+  // silently destroying the pixel-true rooftop guarantee
+  let uvStats=null;
+  const t0=lodTiles[0];
+  if(t0){
+    const rm=t0.merged.children.find(m=>m.material===roofMatLive);
+    if(rm&&rm.geometry.attributes.uv){
+      const uv=rm.geometry.attributes.uv;
+      let uMin=9,uMax=-9,vMin=9,vMax=-9;
+      for(let i=0;i<uv.count;i++){
+        const u=uv.getX(i),v=uv.getY(i);
+        uMin=Math.min(uMin,u); uMax=Math.max(uMax,u);
+        vMin=Math.min(vMin,v); vMax=Math.max(vMax,v);
+      }
+      uvStats={count:uv.count,uMin:+uMin.toFixed(3),uMax:+uMax.toFixed(3),
+        vMin:+vMin.toFixed(3),vMax:+vMax.toFixed(3),
+        varies:(uMax-uMin)>1e-4&&(vMax-vMin)>1e-4};
+    } else uvStats={missing:true};
+  }
+  return {uvStats,indexedSourceGeoms:indexed,
+    srcRoofVerts,mergedRoofVerts,roofMatch:srcRoofVerts===mergedRoofVerts,
+    srcWallVerts,mergedWallVerts,wallMatch:srcWallVerts===mergedWallVerts};
+};
 window.__atlasLOD=()=>({tiles:lodTiles.length,
   far:lodTiles.filter(t=>t.far).length,
   buildings:cityGroup.children.length,
