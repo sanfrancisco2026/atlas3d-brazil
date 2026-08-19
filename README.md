@@ -30,6 +30,11 @@ the module script.)
 - **Pixel-true rooftops** — every roof shows exactly the vertical satellite
   image over its footprint; mosaic geo-registration is verified sub-pixel by
   built-in audit hooks (`__atlasGeoCheck`, `__atlasRoofPixelCheck`).
+- **Level of detail** — the scene is cut into ground tiles: tiles near the
+  camera keep full per-building meshes (photo facades, window glow), far
+  tiles collapse to two merged draw calls whose roofs reuse the *same*
+  satellite material — pixel-true rooftops at any distance, with hysteresis
+  so tiles never flicker at the boundary.
 - **Living streets** — mixed GLB vehicle fleet (cars/motos/vans/buses/semis)
   driving a real road-network graph with junction continuity, lane discipline
   clamped to carriageway width, and edge-portal entry/exit.

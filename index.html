@@ -586,6 +586,7 @@ const VAN_PAINT=[0xf2f2f2,0x9fc7e8,0xd94f4f,0x7fb069,0xe8c34d,0xe8955f];
 let camAnim = null, timeAnim = null;
 let matRoadMajor, matRoadMinor, matCar, wallMats = [], vehMats = [], wheelMat = null;
 let facadeAnim = [], facadeTickT = 0, facadeTickI = 0, nightNow = 0, roofMatLive = null;
+let lodGroup = null, lodTiles = [], lodWallMat = null;
 let pollutionCtx={stacks:[],indArea:0,majorKm:0,minorKm:0}, aqState=null,
     pollGroup=null, exhaustMat=null, smokeMat=null, smokeSys=null, windDir=0;
 let lampGroup=null, streetLampMat=null, lampSpriteMat=null, nightCalib=1, envRT=null;
@@ -1390,7 +1391,8 @@ function initThree(){
   cityGroup=new THREE.Group(); roadGroup=new THREE.Group();
   treeGroup=new THREE.Group(); routeGroup=new THREE.Group();
   synGroup=new THREE.Group(); labelGroup=new THREE.Group();
-  scene.add(cityGroup,roadGroup,treeGroup,routeGroup,synGroup,labelGroup);
+  lodGroup=new THREE.Group();
+  scene.add(cityGroup,roadGroup,treeGroup,routeGroup,synGroup,labelGroup,lodGroup);
 
   // sky + sun
   sky=new Sky(); sky.scale.setScalar(20000); scene.add(sky);
@@ -2265,6 +2267,7 @@ function detectRoofInfill(prepared,roadSamples){
 
 function buildBuildings(osm){
   clearGroup(cityGroup); clearGroup(synGroup);
+  clearGroup(lodGroup); lodTiles=[];
   // reset any Mapillary-reference tint from the previous zone
   [1,2].forEach(i=>{ if(wallMats[i]) wallMats[i].color.setRGB(1,1,1); });
   pollutionCtx.stacks=[]; pollutionCtx.indArea=0;
@@ -6208,6 +6211,7 @@ $('buildBtn').addEventListener('click',async()=>{
     flyTo(new THREE.Vector3(R*0.35,R*0.42,R*0.5),new THREE.Vector3(0,20,0),3.4);
     controls.autoRotate=true; controls.autoRotateSpeed=0.4;
     $('viewOrbit').classList.add('active-mode');
+    buildLOD();
     log('IMMERSION READY - welcome to your city','ok');
 
     // planner overlays + optional photo facades (async, non-blocking)
@@ -6240,6 +6244,7 @@ $('resetBtn').addEventListener('click',()=>{
   setRouteMode(false); hideBldCard(); clearAnalysis(); routeCurve=null; routePulses=[];
   clearGroup(cityGroup); clearGroup(roadGroup); clearGroup(treeGroup); clearGroup(routeGroup);
   clearGroup(synGroup); clearGroup(labelGroup); synGroup.visible=false;
+  clearGroup(lodGroup); lodTiles=[];
   $('synBtn').textContent='Synthetic infill: OFF';
   plannerClear();
   removeTraffic();
@@ -6273,12 +6278,127 @@ $('resetBtn').addEventListener('click',()=>{
 /* ============================================================
    MAIN LOOP
 ============================================================ */
+/* ============================================================
+   LEVEL OF DETAIL - tile-based, ABot-Earth-style hierarchy
+   Every building is its own mesh (2 draw calls each: satellite roof +
+   textured facade), so a dense zone costs 2,500+ draw calls even when
+   most buildings are specks near the horizon. The scene is cut into
+   LOD_TILES x LOD_TILES ground tiles; tiles NEAR the camera show the
+   full per-building meshes (photo facades, window glow), tiles FAR
+   from it swap to two merged meshes - the roofs merged into one
+   geometry that keeps the SAME satellite texture and UVs (pixel-true
+   rooftops at any distance, per the data-fidelity rules), and the
+   walls merged under one flat vertex-tinted material. Far tile = 2
+   draw calls instead of 2-per-building.
+============================================================ */
+const LOD_TILES=6, LOD_NEAR=380, LOD_HYST=45, LOD_MIN_BUILDINGS=150;
+// Pure (unit-tested): which ground tile does scene point (x,z) fall in?
+function lodTileIndex(x,z,halfW,halfH,nT){
+  const tx=Math.min(nT-1,Math.max(0,Math.floor((x+halfW)/(2*halfW/nT))));
+  const tz=Math.min(nT-1,Math.max(0,Math.floor((z+halfH)/(2*halfH/nT))));
+  return tz*nT+tx;
+}
+// Pure (unit-tested): far or near, with hysteresis so a tile sitting on
+// the boundary doesn't flicker between detail levels every frame.
+function lodModeFor(dist,near,hyst,isFar){
+  return isFar ? dist>=near-hyst : dist>near+hyst;
+}
+// Pure (unit-tested): copy the triangles of ONE material group out of a
+// multi-group geometry's attribute arrays -> {name: Float32Array}.
+function sliceGroupArrays(groups,attrs,matIndex){
+  const ranges=groups.filter(g=>g.materialIndex===matIndex);
+  const total=ranges.reduce((s,g)=>s+g.count,0);
+  const out={};
+  for(const name of Object.keys(attrs)){
+    const src=attrs[name], it=src.itemSize, arr=new Float32Array(total*it);
+    let o=0;
+    for(const g of ranges){
+      arr.set(src.array.subarray(g.start*it,(g.start+g.count)*it),o);
+      o+=g.count*it;
+    }
+    out[name]=arr;
+  }
+  return out;
+}
+function sliceGroupGeometry(geom,matIndex){
+  const attrs={};
+  for(const name of ['position','normal','uv','color'])
+    if(geom.attributes[name]) attrs[name]=geom.attributes[name];
+  const sliced=sliceGroupArrays(geom.groups,attrs,matIndex);
+  const g=new THREE.BufferGeometry();
+  for(const name of Object.keys(sliced))
+    g.setAttribute(name,new THREE.BufferAttribute(sliced[name],attrs[name].itemSize));
+  return g;
+}
+function buildLOD(){
+  clearGroup(lodGroup); lodTiles=[];
+  if(!geoCtx||cityGroup.children.length<LOD_MIN_BUILDINGS) return;
+  const {sceneW,sceneH}=geoCtx, halfW=sceneW/2, halfH=sceneH/2;
+  if(!lodWallMat)
+    lodWallMat=new THREE.MeshLambertMaterial({vertexColors:true,
+      emissive:0xffd9a0,emissiveIntensity:0});
+  const members=Array.from({length:LOD_TILES*LOD_TILES},()=>[]);
+  cityGroup.children.forEach(m=>{
+    const r=m.userData&&m.userData.ring;
+    if(!r||!r.length) return;
+    let cx=0,cz=0; r.forEach(([x,z])=>{ cx+=x; cz+=z; });
+    members[lodTileIndex(cx/r.length,cz/r.length,halfW,halfH,LOD_TILES)].push(m);
+  });
+  members.forEach((ms,i)=>{
+    if(!ms.length) return;
+    const roof=mergeGeometries(ms.map(m=>sliceGroupGeometry(m.geometry,0)));
+    const wall=mergeGeometries(ms.map(m=>sliceGroupGeometry(m.geometry,1)));
+    const tile=new THREE.Group();
+    // roofMatLive: the SAME satellite material the live roofs use, so
+    // far rooftops stay the real photographed roof, not an impression
+    if(roof){ const mr=new THREE.Mesh(roof,roofMatLive);
+      mr.castShadow=mr.receiveShadow=true; tile.add(mr); }
+    if(wall){ const mw=new THREE.Mesh(wall,lodWallMat);
+      mw.castShadow=mw.receiveShadow=true; tile.add(mw); }
+    tile.visible=false;
+    lodGroup.add(tile);
+    const tx=i%LOD_TILES, tz=(i-tx)/LOD_TILES;
+    lodTiles.push({cx:-halfW+(tx+0.5)*sceneW/LOD_TILES,
+                   cz:-halfH+(tz+0.5)*sceneH/LOD_TILES,
+                   // tallest roof in the tile: distance is measured to the
+                   // tile's building TOPS, not the ground - hovering 60m
+                   // above a 220m tower is NEAR that tower, even though
+                   // the camera is 280m above the tile's ground center
+                   maxH:ms.reduce((s,m)=>Math.max(s,m.userData.h||0),0),
+                   merged:tile,members:ms,far:false});
+  });
+  log(`LOD: ${lodTiles.length} tiles over ${cityGroup.children.length} buildings `+
+    `(full detail within ${LOD_NEAR}m of the camera)`,'ai');
+}
+function lodTick(){
+  if(!lodTiles.length) return;
+  // window glow on far tiles: one shared emissive ramp against nightNow,
+  // so a distant skyline still lights up after dark
+  if(lodWallMat) lodWallMat.emissiveIntensity=nightNow*0.22;
+  for(const t of lodTiles){
+    const dx=camera.position.x-t.cx,
+          dy=Math.max(0,camera.position.y-t.maxH),
+          dz=camera.position.z-t.cz;
+    const far=lodModeFor(Math.sqrt(dx*dx+dy*dy+dz*dz),LOD_NEAR,LOD_HYST,t.far);
+    if(far===t.far) continue;
+    t.far=far; t.merged.visible=far;
+    for(const m of t.members) m.visible=!far;
+  }
+}
+window.__atlasLOD=()=>({tiles:lodTiles.length,
+  far:lodTiles.filter(t=>t.far).length,
+  buildings:cityGroup.children.length,
+  drawCalls:renderer.info.render.calls,
+  cam:[camera.position.x,camera.position.y,camera.position.z].map(v=>Math.round(v)),
+  dists:lodTiles.slice(0,6).map(t=>Math.round(Math.hypot(
+    camera.position.x-t.cx,Math.max(0,camera.position.y-t.maxH),
+    camera.position.z-t.cz)))});
 function animate(){
   requestAnimationFrame(animate);
   const now=performance.now(); const dt=Math.min((now-prevT)/1000,0.1); prevT=now;
   updateCamAnim(dt);
   controls.update();
-  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt); updateNav(dt); facadeGlowTick(dt);
+  if(appState==='city'){ updateTraffic(dt); updatePulses(dt); updatePollution(dt); updateTimeAnim(dt); updateRain(dt); updateNav(dt); facadeGlowTick(dt); lodTick();
     for(let i=0;i<windRotors.length;i++) windRotors[i].rotation.z+=dt*1.6; }
   composer.render();
 }
